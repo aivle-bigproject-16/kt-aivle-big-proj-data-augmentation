@@ -43,7 +43,10 @@ generator._make_one()
 
 역할별 파일:
 
-- `planner.py`: 원본 탐색, image–JSON pairing, 감사, source 선택, plan 생성
+- `planner.py`: 원본 탐색, image–JSON pairing, 감사, source 선택, plan 생성. 쌍별
+  검증(이미지 디코드·해시·porosity)은 config `jobs` 수만큼 프로세스로 병렬 처리하고,
+  픽셀 중복 제거와 계통 오류 판정 등 순서 의존 병합은 정렬 순서대로 직렬 수행해
+  raw fingerprint를 병렬·직렬 동일하게 유지한다
 - `preprocessing/stages.py`: 한 sample의 순차 전처리와 좌표 동기화
 - `augment.py`: CT/RGB failure case의 실제 영상 변환
 - `geometry.py`: ROI, polygon parsing/clipping, affine 좌표 변환
@@ -139,7 +142,9 @@ quality-fail-augment verify --output "E:\quality_fail_40k_v1.5"
 
 - ambiguous `(raw_split, modality, stem)` pair는 전체 plan을 중단한다.
 - image-only, JSON-only와 개별 손상/schema 오류는 감사 후 source만 제외한다.
-- 같은 오류가 preflight 5건, 전체 scan 연속 20건 또는 누적 100건이면 중단한다.
+- 같은 오류가 preflight 5건, 전체 scan 연속 20건 또는 누적 100건이면 중단한다. 단
+  CT porosity 초과와 픽셀 동일 중복(`duplicate_pixel_hash`)은 의도된 정상 제외이므로
+  이 계통 오류 카운터에서 면제한다.
 - config hash, source hash 또는 raw fingerprint가 승인 plan과 다르면 생성하지 않는다.
 - 생성 실패는 같은 case로 재시도하고 같은 modality의 reserve source로 교체한다.
 - reserve까지 소진하면 전체 생성을 실패 처리한다.
