@@ -56,6 +56,7 @@ param(
     [string]$Output,
     [string]$Remote,
     [int]$LimitPerModality = 100,
+    [switch]$TrustPlan,
     [switch]$KeepDisplay,
     [switch]$Detached
 )
@@ -73,10 +74,11 @@ if ($Detached) {
         if ($value) { $forward += @("-$name", (Quote $value)) }
     }
     $forward += @("-LimitPerModality", "$LimitPerModality")
+    if ($TrustPlan) { $forward += "-TrustPlan" }
     if ($KeepDisplay) { $forward += "-KeepDisplay" }
     $child = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $forward -WindowStyle Hidden -PassThru
     Write-Host "$Stage 를 분리 실행으로 시작했다. PID $($child.Id)" -ForegroundColor Cyan
-    if ($Output) { Write-Host "진행 상황: $Output\pipeline.status" -ForegroundColor Cyan }
+    if ($Output) { Write-Host "진행 상황: $Output-pipeline\pipeline.status" -ForegroundColor Cyan }
     exit 0
 }
 
@@ -94,12 +96,16 @@ if (-not (Test-Path $python)) {
 }
 
 if (-not $Output) { Write-Error "-Output 은 모든 단계에서 필요하다."; exit 2 }
-New-Item -ItemType Directory -Force -Path $Output | Out-Null
-$logDir = Join-Path $Output "logs"
+# 래퍼 부기(status·로그)는 데이터 output 안이 아니라 형제 <Output>-pipeline 에 둔다.
+# generate 는 빈 output 을 요구하므로, output 을 미리 만들거나 그 안에 로그를 쓰면
+# "Output directory is not empty" 로 즉시 실패한다. output 자체는 각 툴이 만든다.
+$pipeDir = "$Output-pipeline"
+New-Item -ItemType Directory -Force -Path $pipeDir | Out-Null
+$logDir = Join-Path $pipeDir "logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $log = Join-Path $logDir "$($Stage)_$stamp.log"
-$status = Join-Path $Output "pipeline.status"
+$status = Join-Path $pipeDir "pipeline.status"
 
 # smoke 가 측정한 worker_peak_rss_bytes 를 config 에 넣어 <config>.measured.json 을 만든다.
 function Write-MeasuredConfig([string]$configPath, [string]$smokeOutput) {
@@ -161,14 +167,17 @@ switch ($Stage) {
         if (-not $RawRoot -or -not $Config -or -not $Plan) { Write-Error "-RawRoot·-Config·-Plan 필요"; exit 2 }
         $cliArgs = @("generate", "--raw-root", $RawRoot, "--config", $Config, "--plan", $Plan,
             "--output", $Output, "--limit-per-modality", "$LimitPerModality")
+        if ($TrustPlan) { $cliArgs += "--trust-plan" }
     }
     "generate" {
         if (-not $RawRoot -or -not $Config -or -not $Plan) { Write-Error "-RawRoot·-Config·-Plan 필요"; exit 2 }
         $cliArgs = @("generate", "--raw-root", $RawRoot, "--config", $Config, "--plan", $Plan, "--output", $Output)
+        if ($TrustPlan) { $cliArgs += "--trust-plan" }
     }
     "resume" {
         if (-not $RawRoot -or -not $Config -or -not $Plan) { Write-Error "-RawRoot·-Config·-Plan 필요"; exit 2 }
         $cliArgs = @("generate", "--raw-root", $RawRoot, "--config", $Config, "--plan", $Plan, "--output", $Output, "--resume")
+        if ($TrustPlan) { $cliArgs += "--trust-plan" }
     }
     "verify" {
         $cliArgs = @("verify", "--output", $Output)
