@@ -138,6 +138,47 @@ quality-fail-augment generate `
 quality-fail-augment verify --output "E:\quality_fail_40k_v1.5"
 ```
 
+## 자동 파이프라인 (`run_pipeline.ps1`)
+
+`run_pipeline.ps1`은 위의 개별 명령을 하나의 진입점으로 묶는다. pwsh(PowerShell 7)로
+실행하며, 각 단계는 실행 유지(keep-awake)와 `-Detached` 분리 실행, `<Output>\pipeline.status`
+하트비트, 단계별 로그를 지원한다. 스테이지는 `plan`, `smoke`, `generate`, `resume`,
+`verify`, `upload`이다.
+
+```powershell
+# 1) 병렬 scan 으로 plan 생성
+pwsh -File .\run_pipeline.ps1 -Stage plan `
+  -RawRoot "E:\103.배터리 불량 이미지 데이터" -Config .\config.40k.json `
+  -Output "E:\quality_fail_40k_plan_v1.5" -Detached
+
+# 2) smoke 로 worker_peak_rss_bytes 측정 → config.40k.measured.json 자동 생성
+pwsh -File .\run_pipeline.ps1 -Stage smoke `
+  -RawRoot "E:\103.배터리 불량 이미지 데이터" -Config .\config.40k.json `
+  -Plan "E:\quality_fail_40k_plan_v1.5\manifests\generation_plan.csv" `
+  -Output "E:\quality_fail_40k_smoke_v1.5" -Detached
+
+# 3) 측정 config 로 plan 을 다시 만든 뒤 full 생성. QA 게이트에서 멈춘다(exit=10).
+pwsh -File .\run_pipeline.ps1 -Stage generate `
+  -RawRoot "E:\103.배터리 불량 이미지 데이터" -Config .\config.40k.measured.json `
+  -Plan "E:\quality_fail_40k_plan2_v1.5\manifests\generation_plan.csv" `
+  -Output "E:\quality_fail_40k_v1.5" -Detached
+
+# 4) 사람이 fail_visual_qa.csv 를 채운 뒤 재개 → 최종 ZIP 공개
+pwsh -File .\run_pipeline.ps1 -Stage resume `
+  -RawRoot "E:\103.배터리 불량 이미지 데이터" -Config .\config.40k.measured.json `
+  -Plan "E:\quality_fail_40k_plan2_v1.5\manifests\generation_plan.csv" `
+  -Output "E:\quality_fail_40k_v1.5" -Detached
+
+# 5) 원격(gdrive 등) 업로드
+pwsh -File .\run_pipeline.ps1 -Stage upload `
+  -Output "E:\quality_fail_40k_v1.5" -Remote "gdrive:quality_fail_40k_v1.5" -Detached
+```
+
+`generate`가 끝나면 visual-QA 게이트에서 `exit=10`으로 멈추며, 사람이 510장을 검토해
+`manifests\fail_visual_qa.csv`의 `reviewer`와 `approved`를 채워야 한다. 스크립트는 이 사람
+검토를 대신 수행하지 않는다. `upload`는 `rclone`이 설치되고 원격이 설정돼 있어야 하며,
+매니페스트와 summary를 먼저 올린 뒤 augmentation ZIP과 이미지·라벨 트리를 올린다.
+
 ## 중단과 제외
 
 - ambiguous `(raw_split, modality, stem)` pair는 전체 plan을 중단한다.
