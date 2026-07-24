@@ -274,15 +274,30 @@ def _ct_case(
         result = ImageEnhance.Contrast(result).enhance(contrast)
         records.append(_record(2, "low_material_contrast", severity, contrast_factor=contrast))
     elif case == "ct_low_resolution":
-        scale = rng.uniform(0.12, 0.42)
-        small_size = (max(1, round(result.width * scale)), max(1, round(result.height * scale)))
+        # The edge-energy gate requires the retained ratio to stay in [0.30, 0.80]. A random
+        # scale cannot hit that band reliably because the ratio depends on each CT source's
+        # own edge content — a fixed 0.24-0.45 scale still failed 59% of sources. Instead,
+        # binary-search the downscale factor toward a random target ratio inside the gate, so
+        # the result lands in [0.30, 0.80] by construction regardless of the source.
+        def _edge_energy(img: Image.Image) -> float:
+            gray = np.asarray(img.convert("L"), dtype=np.float32)
+            return float(np.abs(np.diff(gray, axis=1)).mean() + np.abs(np.diff(gray, axis=0)).mean())
+
+        base_edge = max(_edge_energy(result), 1e-6)
         method = rng.choice((Image.Resampling.BOX, Image.Resampling.BILINEAR))
-        result = result.resize(small_size, method).resize(image.size, Image.Resampling.BILINEAR)
-        records.append(_record(1, "resolution_downsample_restore", severity, scale=scale, downsample=str(method)))
-        if rng.random() < 0.50:
-            radius = rng.uniform(0.8, 2.5)
-            result = result.filter(ImageFilter.GaussianBlur(radius))
-            records.append(_record(2, "mild_blur", severity, radius_final_space=radius))
+        target = rng.uniform(0.42, 0.70)
+        low_scale, high_scale, scale, restored = 0.10, 0.75, 0.30, result
+        for _ in range(9):
+            scale = (low_scale + high_scale) / 2.0
+            small_size = (max(1, round(result.width * scale)), max(1, round(result.height * scale)))
+            restored = result.resize(small_size, method).resize(image.size, Image.Resampling.BILINEAR)
+            ratio = _edge_energy(restored) / base_edge
+            if ratio > target:
+                high_scale = scale
+            else:
+                low_scale = scale
+        result = restored
+        records.append(_record(1, "resolution_downsample_restore", severity, scale=round(scale, 4), downsample=str(method)))
     elif case == "ct_sparse_projection_aliasing":
         count = rng.randint(12, 64)
         result = _signed_lines(result, rng, count, (1, 3), (10, 40), radial=True)
@@ -415,13 +430,25 @@ def _rgb_case(
         draw = ImageDraw.Draw(overlay)
         patches = []
         eligible = _mask_points(mask)
+        # The glare must overlap the outline by >=70%. Sizing patches to the frame (up to a
+        # quarter of the width/height) and centring them on any outline point let large patches
+        # spill off the small cylindrical outline, so 65% of sources failed. Cap each patch to a
+        # fraction of the mask's own extent and pull its centre toward the mask centroid so the
+        # patch stays inside the outline.
+        if eligible:
+            eligible_array = np.asarray(eligible, dtype=np.float64)
+            centroid_x, centroid_y = eligible_array[:, 0].mean(), eligible_array[:, 1].mean()
+            half_w = max(2.0, (eligible_array[:, 0].max() - eligible_array[:, 0].min()) / 2.0)
+            half_h = max(2.0, (eligible_array[:, 1].max() - eligible_array[:, 1].min()) / 2.0)
+        else:
+            centroid_x, centroid_y = result.width / 2.0, result.height / 2.0
+            half_w, half_h = result.width / 4.0, result.height / 4.0
         for _ in range(count):
-            rx, ry = rng.randint(max(2, result.width // 20), max(3, result.width // 4)), rng.randint(max(2, result.height // 20), max(3, result.height // 4))
-            cx, cy = (
-                rng.choice(eligible)
-                if eligible
-                else (rng.randint(0, result.width - 1), rng.randint(0, result.height - 1))
-            )
+            rx = rng.randint(max(2, int(half_w * 0.15)), max(3, int(half_w * 0.42)))
+            ry = rng.randint(max(2, int(half_h * 0.15)), max(3, int(half_h * 0.42)))
+            base = rng.choice(eligible) if eligible else (int(centroid_x), int(centroid_y))
+            cx = int(round(base[0] * 0.4 + centroid_x * 0.6))
+            cy = int(round(base[1] * 0.4 + centroid_y * 0.6))
             alpha = round(255 * rng.uniform(0.35, 0.92))
             draw.ellipse((cx - rx, cy - ry, cx + rx, cy + ry), fill=(255, 250, 240, alpha))
             patches.append({"center": [cx, cy], "radius": [rx, ry], "alpha": alpha / 255})
