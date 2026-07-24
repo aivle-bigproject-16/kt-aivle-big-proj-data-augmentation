@@ -141,8 +141,9 @@ quality-fail-augment verify --output "E:\quality_fail_40k_v1.5"
 ## 자동 파이프라인 (`run_pipeline.ps1`)
 
 `run_pipeline.ps1`은 위의 개별 명령을 하나의 진입점으로 묶는다. pwsh(PowerShell 7)로
-실행하며, 각 단계는 실행 유지(keep-awake)와 `-Detached` 분리 실행, `<Output>\pipeline.status`
-하트비트, 단계별 로그를 지원한다. 스테이지는 `plan`, `smoke`, `generate`, `resume`,
+실행하며, 각 단계는 실행 유지(keep-awake)와 `-Detached` 분리 실행, `<Output>-pipeline\pipeline.status`
+하트비트, 단계별 로그를 지원한다. 래퍼의 상태와 로그는 데이터 output 안이 아니라 형제
+`<Output>-pipeline` 폴더에 쌓인다(generate 는 빈 output 을 요구하기 때문이다). 스테이지는 `plan`, `smoke`, `generate`, `resume`,
 `verify`, `upload`이다.
 
 ```powershell
@@ -178,6 +179,12 @@ pwsh -File .\run_pipeline.ps1 -Stage upload `
 `manifests\fail_visual_qa.csv`의 `reviewer`와 `approved`를 채워야 한다. 스크립트는 이 사람
 검토를 대신 수행하지 않는다. `upload`는 `rclone`이 설치되고 원격이 설정돼 있어야 하며,
 매니페스트와 summary를 먼저 올린 뒤 augmentation ZIP과 이미지·라벨 트리를 올린다.
+
+`generate`, `smoke`, `resume`은 시작할 때마다 plan 검증을 위해 전체 raw를 다시 스캔한다
+(약 44분). plan 직후처럼 원본이 그대로임이 확실하면 `-TrustPlan`(툴의 `--trust-plan`)을
+주어 이 전체 재스캔과 fingerprint 재대조를 건너뛸 수 있다. 이때도 plan이 쓰는
+40k+reserve 소스는 각각 SHA-256으로 여전히 검증하므로 선택된 소스의 무결성은 보장된다.
+smoke 기준으로 재스캔 포함 약 53분이 `-TrustPlan`에서는 약 3분으로 줄어든다.
 
 ## 중단과 제외
 
