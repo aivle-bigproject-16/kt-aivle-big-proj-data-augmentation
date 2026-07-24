@@ -166,6 +166,7 @@ def _validate_plan(
     raw_root: Path,
     config: dict[str, Any],
     rows: list[dict[str, str]],
+    trust_plan: bool = False,
 ) -> None:
     if not rows:
         raise ValueError("Plan is empty")
@@ -189,6 +190,11 @@ def _validate_plan(
             != row["json_sha256"]
         ):
             raise ValueError(f"Plan source changed: {row['raw_image_path']}")
+    # trust_plan은 전체 raw 재스캔(약 44분)과 fingerprint 재대조를 건너뛴다. plan이 쓰는
+    # 40k+reserve 소스는 위에서 sha256으로 이미 pin 검증했으므로, 선택된 소스의 무결성은
+    # 보장된다. 건너뛰는 것은 미선택 소스까지 포함한 전체 fingerprint 일치 확인뿐이다.
+    if trust_plan:
+        return
     candidates, _, systemic, _ = scan(raw_root, config)
     if systemic:
         raise ValueError("Raw dataset now contains blocking_systemic errors")
@@ -548,13 +554,14 @@ def generate(
     output: Path,
     limit_per_modality: int | None = None,
     resume: bool = False,
+    trust_plan: bool = False,
 ) -> dict[str, Any]:
     if output.exists() and any(output.iterdir()) and not resume:
         raise ValueError(f"Output directory is not empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
     logger = configure_logger("quality_fail_augment.generate", output / "logs" / "generation.log")
     rows = _read_csv(plan_path)
-    _validate_plan(raw_root, config, rows)
+    _validate_plan(raw_root, config, rows, trust_plan)
     reserve_path = plan_path.parent / "reserve_sources.csv"
     reserve_rows = _read_csv(reserve_path) if reserve_path.exists() else []
     reserve_queues = {

@@ -33,6 +33,12 @@ def parser() -> argparse.ArgumentParser:
     make.add_argument("--output", type=Path, required=True)
     make.add_argument("--limit-per-modality", type=int)
     make.add_argument("--resume", action="store_true")
+    make.add_argument(
+        "--trust-plan",
+        action="store_true",
+        help="Skip the full raw re-scan and fingerprint recheck; still verifies each "
+        "planned source by SHA-256",
+    )
     check = commands.add_parser("verify", help="Verify an existing generated dataset")
     check.add_argument("--output", type=Path, required=True)
     return root
@@ -47,7 +53,7 @@ def main() -> None:
     elif args.command == "plan":
         result = create_plan(args.raw_root.resolve(), _config(args.config), args.output.resolve())
     elif args.command == "generate":
-        result = generate(args.raw_root.resolve(), _config(args.config), args.plan.resolve(), args.output.resolve(), args.limit_per_modality, args.resume)
+        result = generate(args.raw_root.resolve(), _config(args.config), args.plan.resolve(), args.output.resolve(), args.limit_per_modality, args.resume, args.trust_plan)
     else:
         verify_dataset(args.output.resolve())
         result = {"verified": True}
