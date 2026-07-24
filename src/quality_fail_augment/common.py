@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -74,12 +75,28 @@ def ensure_empty_output(path: Path, resume: bool = False) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def atomic_write(path: Path, data: bytes) -> None:
+def atomic_write(path: Path, data: bytes, replace_attempts: int = 8) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     with temporary.open("wb") as handle:
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    # Windows raises PermissionError (WinError 5/32) when the destination is momentarily
+    # held open by another process — a reader inspecting the file, an antivirus, or the
+    # search indexer. os.replace is otherwise atomic, so retry with backoff instead of
+    # failing the whole run on a transient sharing violation.
+    last_error: OSError | None = None
+    for attempt in range(replace_attempts):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            time.sleep(0.1 * (2**attempt))
+    try:
+        temporary.unlink()
+    except OSError:
+        pass
+    raise RuntimeError(f"atomic replace failed after {replace_attempts} attempts: {path}") from last_error
 
