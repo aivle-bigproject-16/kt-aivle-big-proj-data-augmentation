@@ -1,0 +1,2 @@
+[console_scripts]
+quality-fail-augment = quality_fail_augment.cli:main

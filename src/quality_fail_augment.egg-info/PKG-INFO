@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: quality-fail-augment
+Version: 1.5
+Summary: Deterministic CT/RGB PASS-FAIL dataset planner and generator
+Requires-Python: >=3.10
+Requires-Dist: Pillow==12.3.0
+Requires-Dist: numpy==2.5.1
+Requires-Dist: shapely==2.1.2
+Requires-Dist: psutil==7.0.0
