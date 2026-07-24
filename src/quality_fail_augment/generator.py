@@ -607,6 +607,7 @@ def generate(
     existing = {row["synthetic_id"] for row in manifest_rows}
     tasks = [row for row in selected if row["synthetic_id"] not in existing]
     effective_jobs = _effective_jobs(config, len(tasks))
+    checkpoint_interval = max(1, int(config.get("checkpoint_interval", 25)))
     chunk_size = max(
         1,
         len(tasks)
@@ -722,7 +723,12 @@ def generate(
             manifest_rows.append(manifest)
             lineage_rows.append(lineage)
             existing.add(row["synthetic_id"])
-        _write_checkpoint(output, manifest_rows, lineage_rows, errors)
+        # Checkpoint every `checkpoint_interval` consumed samples, not every one:
+        # rewriting the full manifest CSVs per sample is O(n^2) over a 40k run and
+        # widens the window where a reader/antivirus can trip the atomic replace.
+        # The loop flushes a final checkpoint once generation finishes.
+        if (len(manifest_rows) + len(errors)) % checkpoint_interval == 0:
+            _write_checkpoint(output, manifest_rows, lineage_rows, errors)
         staging = output / ".sample_staging" / row["synthetic_id"]
         _remove_path_with_retry(staging)
         progress.update(len(existing), detail=f"실패 {len(errors):,}")
@@ -753,6 +759,7 @@ def generate(
                     consume(row, payload)
                 else:
                     consume(row, error=RuntimeError(payload))
+    _write_checkpoint(output, manifest_rows, lineage_rows, errors)
     monitor_stop.set()
     monitor_thread.join(timeout=2.0)
     generation_elapsed = max(time.monotonic() - generation_started, 1e-9)
@@ -872,79 +879,115 @@ def _coordinate_values(value: Any) -> list[tuple[float, float]]:
     return [point for ring in point_rings(value) for point in ring]
 
 
+def _verify_row_worker(
+    payload: tuple[str, dict[str, Any]]
+) -> tuple[str, tuple[str, str], str, str]:
+    """한 출력 샘플의 모든 로컬 검증을 독립 수행한다(멀티프로세스 워커).
+
+    이미지 디코드·해시·polygon·라벨·이력 검증 등 전역 상태가 필요 없는 검사를 모두
+    처리하고, 중복 판정에 필요한 키(synthetic_id, (modality, stem), image_sha256,
+    output_pixel_hash)만 반환한다. 4종 중복 검사는 메인이 row 순서대로 직렬 수행한다.
+    유효 데이터셋에서는 병렬/직렬 산출이 동일하다.
+    """
+    output_text, row = payload
+    output = Path(output_text)
+    image_path = output / row["image_path"]
+    label_path = output / row["label_json_path"]
+    history_text = row.get("augmentation_json_path", "")
+    history_path = output / history_text if history_text else None
+    if not image_path.is_file() or not label_path.is_file():
+        raise ValueError(f"Missing image/label output: {row['synthetic_id']}")
+    if row["quality_label"] == "pass":
+        if history_text or row.get("augmentation_json_sha256"):
+            raise ValueError(f"PASS sample references augmentation JSON: {row['synthetic_id']}")
+        unexpected = (
+            image_path.parent.parent
+            / "augmentation_json"
+            / f"{image_path.stem}.augmentation.json"
+        )
+        if unexpected.exists():
+            raise ValueError(f"PASS sample has augmentation JSON: {row['synthetic_id']}")
+    else:
+        if history_path is None or not history_path.is_file():
+            raise ValueError(f"FAIL sample missing augmentation JSON: {row['synthetic_id']}")
+    label = load_json(label_path)
+    image = open_normalized(image_path, row["modality"])
+    if label.get("quality_class") != row["quality_label"]:
+        raise ValueError(f"quality_class mismatch: {row['synthetic_id']}")
+    if Path(label["image_info"]["file_name"]).name != image_path.name:
+        raise ValueError(f"label file_name mismatch: {row['synthetic_id']}")
+    if (label["image_info"]["width"], label["image_info"]["height"]) != image.size:
+        raise ValueError(f"label size mismatch: {row['synthetic_id']}")
+    for points in [label.get("swelling", {}).get("battery_outline")] + [
+        defect.get("points") for defect in label.get("defects") or []
+    ]:
+        if points in (None, []):
+            continue
+        for x, y in _coordinate_values(points):
+            if not (0 <= x <= image.width and 0 <= y <= image.height):
+                raise ValueError(f"polygon outside output frame: {row['synthetic_id']}")
+    if history_path is not None:
+        history = load_json(history_path)
+        if history.get("schema_version") != "1.1":
+            raise ValueError(f"augmentation schema mismatch: {row['synthetic_id']}")
+        if history.get("failure_case_count") != 1:
+            raise ValueError(f"FAIL case count mismatch: {row['synthetic_id']}")
+        if history.get("output_image_file") != image_path.name:
+            raise ValueError(f"history image link mismatch: {row['synthetic_id']}")
+        if history.get("label_json_file") != label_path.name:
+            raise ValueError(f"history label link mismatch: {row['synthetic_id']}")
+        if history.get("quality_label") != "fail":
+            raise ValueError(f"history quality mismatch: {row['synthetic_id']}")
+    if sha256_file(image_path) != row["image_sha256"]:
+        raise ValueError(f"image hash mismatch: {row['synthetic_id']}")
+    output_pixel_hash = pixel_hash(image)
+    if sha256_file(label_path) != row["label_json_sha256"]:
+        raise ValueError(f"label hash mismatch: {row['synthetic_id']}")
+    if history_path and sha256_file(history_path) != row["augmentation_json_sha256"]:
+        raise ValueError(f"history hash mismatch: {row['synthetic_id']}")
+    return (
+        row["synthetic_id"],
+        (row["modality"], image_path.stem),
+        row["image_sha256"],
+        output_pixel_hash,
+    )
+
+
 def verify_dataset(
-    output: Path, rows: list[dict[str, Any]] | None = None
+    output: Path, rows: list[dict[str, Any]] | None = None, jobs: int | None = None
 ) -> None:
     rows = rows if rows is not None else _read_csv(output / "manifests" / "dataset_manifest.csv")
+    if jobs is None:
+        jobs = min(8, os.cpu_count() or 1)
     seen_ids: set[str] = set()
     seen_stems: set[tuple[str, str]] = set()
     seen_image_hashes: set[str] = set()
     seen_pixel_hashes: set[str] = set()
-    for row in rows:
-        if row["synthetic_id"] in seen_ids:
-            raise ValueError(f"Duplicate synthetic ID: {row['synthetic_id']}")
-        seen_ids.add(row["synthetic_id"])
-        image_path = output / row["image_path"]
-        label_path = output / row["label_json_path"]
-        history_text = row.get("augmentation_json_path", "")
-        history_path = output / history_text if history_text else None
-        if not image_path.is_file() or not label_path.is_file():
-            raise ValueError(f"Missing image/label output: {row['synthetic_id']}")
-        if row["quality_label"] == "pass":
-            if history_text or row.get("augmentation_json_sha256"):
-                raise ValueError(f"PASS sample references augmentation JSON: {row['synthetic_id']}")
-            unexpected = (
-                image_path.parent.parent
-                / "augmentation_json"
-                / f"{image_path.stem}.augmentation.json"
-            )
-            if unexpected.exists():
-                raise ValueError(f"PASS sample has augmentation JSON: {row['synthetic_id']}")
-        else:
-            if history_path is None or not history_path.is_file():
-                raise ValueError(f"FAIL sample missing augmentation JSON: {row['synthetic_id']}")
-        key = (row["modality"], image_path.stem)
-        if key in seen_stems:
-            raise ValueError(f"Duplicate output stem: {image_path.stem}")
-        seen_stems.add(key)
-        label = load_json(label_path)
-        image = open_normalized(image_path, row["modality"])
-        if label.get("quality_class") != row["quality_label"]:
-            raise ValueError(f"quality_class mismatch: {row['synthetic_id']}")
-        if Path(label["image_info"]["file_name"]).name != image_path.name:
-            raise ValueError(f"label file_name mismatch: {row['synthetic_id']}")
-        if (label["image_info"]["width"], label["image_info"]["height"]) != image.size:
-            raise ValueError(f"label size mismatch: {row['synthetic_id']}")
-        for points in [label.get("swelling", {}).get("battery_outline")] + [
-            defect.get("points") for defect in label.get("defects") or []
-        ]:
-            if points in (None, []):
-                continue
-            for x, y in _coordinate_values(points):
-                if not (0 <= x <= image.width and 0 <= y <= image.height):
-                    raise ValueError(f"polygon outside output frame: {row['synthetic_id']}")
-        if history_path is not None:
-            history = load_json(history_path)
-            if history.get("schema_version") != "1.1":
-                raise ValueError(f"augmentation schema mismatch: {row['synthetic_id']}")
-            if history.get("failure_case_count") != 1:
-                raise ValueError(f"FAIL case count mismatch: {row['synthetic_id']}")
-            if history.get("output_image_file") != image_path.name:
-                raise ValueError(f"history image link mismatch: {row['synthetic_id']}")
-            if history.get("label_json_file") != label_path.name:
-                raise ValueError(f"history label link mismatch: {row['synthetic_id']}")
-            if history.get("quality_label") != "fail":
-                raise ValueError(f"history quality mismatch: {row['synthetic_id']}")
-        if sha256_file(image_path) != row["image_sha256"]:
-            raise ValueError(f"image hash mismatch: {row['synthetic_id']}")
-        if row["image_sha256"] in seen_image_hashes:
-            raise ValueError(f"duplicate output image SHA-256: {row['synthetic_id']}")
-        seen_image_hashes.add(row["image_sha256"])
-        output_pixel_hash = pixel_hash(image)
+
+    def merge(result: tuple[str, tuple[str, str], str, str]) -> None:
+        synthetic_id, stem_key, image_hash, output_pixel_hash = result
+        if synthetic_id in seen_ids:
+            raise ValueError(f"Duplicate synthetic ID: {synthetic_id}")
+        seen_ids.add(synthetic_id)
+        if stem_key in seen_stems:
+            raise ValueError(f"Duplicate output stem: {stem_key[1]}")
+        seen_stems.add(stem_key)
+        if image_hash in seen_image_hashes:
+            raise ValueError(f"duplicate output image SHA-256: {synthetic_id}")
+        seen_image_hashes.add(image_hash)
         if output_pixel_hash in seen_pixel_hashes:
-            raise ValueError(f"duplicate output pixel hash: {row['synthetic_id']}")
+            raise ValueError(f"duplicate output pixel hash: {synthetic_id}")
         seen_pixel_hashes.add(output_pixel_hash)
-        if sha256_file(label_path) != row["label_json_sha256"]:
-            raise ValueError(f"label hash mismatch: {row['synthetic_id']}")
-        if history_path and sha256_file(history_path) != row["augmentation_json_sha256"]:
-            raise ValueError(f"history hash mismatch: {row['synthetic_id']}")
+
+    if jobs > 1 and len(rows) > 1:
+        chunk = max(1, len(rows) // (jobs * 8))
+        with ProcessPoolExecutor(max_workers=jobs) as executor:
+            for result in executor.map(
+                _verify_row_worker,
+                [(str(output), row) for row in rows],
+                chunksize=chunk,
+            ):
+                merge(result)
+    else:
+        for row in rows:
+            merge(_verify_row_worker((str(output), row)))
