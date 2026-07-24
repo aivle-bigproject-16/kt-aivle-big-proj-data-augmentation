@@ -514,32 +514,54 @@ def _rgb_case(
         overlay = Image.new("RGBA", result.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
         curves = []
+        long_side = max(result.size)
         eligible = _mask_points(mask)
+        # Orient each hair along the battery outline's principal axis and centre it on the
+        # mask, so most of its length stays inside the outline. Cylindrical cells occupy only
+        # ~11% of the frame (mask diagonal ~0.35-0.6 of the long side), so the previous random
+        # outward hair almost never met the >=50% intersection gate — 87% of hair sources
+        # exhausted their retries. Capping length to <=1.5x the inside extent keeps the
+        # intersection above 0.5 by construction while staying inside the 0.35-0.90 length gate.
+        if eligible:
+            points_array = np.asarray(eligible, dtype=np.float64)
+            centroid = points_array.mean(axis=0)
+            centred = points_array - centroid
+            covariance = np.cov(centred.T) if len(points_array) > 1 else np.eye(2)
+            eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+            axis_major = eigenvectors[:, int(np.argmax(eigenvalues))]
+            projections = centred @ axis_major
+            inside_len = float(projections.max() - projections.min())
+        else:
+            centroid = np.array([result.width / 2.0, result.height / 2.0])
+            axis_major = np.array([1.0, 0.0])
+            inside_len = 0.6 * long_side
         for _ in range(count):
-            start = (
-                rng.choice(eligible)
-                if eligible
-                else (rng.randint(0, result.width), rng.randint(0, result.height))
+            jitter = rng.uniform(-0.12, 0.12)
+            cos_j, sin_j = math.cos(jitter), math.sin(jitter)
+            direction = np.array(
+                [
+                    axis_major[0] * cos_j - axis_major[1] * sin_j,
+                    axis_major[0] * sin_j + axis_major[1] * cos_j,
+                ]
             )
-            target_length = rng.uniform(0.35, 0.90) * max(result.size)
-            angle = rng.uniform(0, math.tau)
-            end = (
-                start[0] + math.cos(angle) * target_length,
-                start[1] + math.sin(angle) * target_length,
-            )
-            normal = (-math.sin(angle), math.cos(angle))
-            bend1, bend2 = rng.uniform(-0.15, 0.15), rng.uniform(-0.15, 0.15)
+            desired = rng.uniform(0.35, 0.90) * long_side
+            length = min(desired, 0.88 * long_side, max(0.35 * long_side, 1.5 * inside_len))
+            centre = centroid + axis_major * (rng.uniform(-0.10, 0.10) * inside_len)
+            start = centre - direction * (length / 2.0)
+            end = centre + direction * (length / 2.0)
+            normal = np.array([-direction[1], direction[0]])
+            bend1, bend2 = rng.uniform(-0.06, 0.06), rng.uniform(-0.06, 0.06)
             points = [
-                start,
+                (float(start[0]), float(start[1])),
                 (
-                    start[0] + (end[0] - start[0]) / 3 + normal[0] * target_length * bend1,
-                    start[1] + (end[1] - start[1]) / 3 + normal[1] * target_length * bend1,
+                    float(start[0] + (end[0] - start[0]) / 3 + normal[0] * length * bend1),
+                    float(start[1] + (end[1] - start[1]) / 3 + normal[1] * length * bend1),
                 ),
                 (
-                    start[0] + 2 * (end[0] - start[0]) / 3 + normal[0] * target_length * bend2,
-                    start[1] + 2 * (end[1] - start[1]) / 3 + normal[1] * target_length * bend2,
+                    float(start[0] + 2 * (end[0] - start[0]) / 3 + normal[0] * length * bend2),
+                    float(start[1] + 2 * (end[1] - start[1]) / 3 + normal[1] * length * bend2),
                 ),
-                end,
+                (float(end[0]), float(end[1])),
             ]
             width, alpha = rng.randint(1, 3), rng.randint(115, 230)
             samples = []
