@@ -7,6 +7,7 @@ import os
 import random
 import time
 from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -219,6 +220,30 @@ def _validate_pair(
         }
 
 
+def _scan_jobs(config: dict[str, Any]) -> int:
+    requested = max(1, int(config.get("jobs", 1)))
+    return min(requested, os.cpu_count() or 1)
+
+
+def _validate_pair_worker(
+    payload: tuple[Path, str, str, str, Path, Path, dict[str, Any]]
+) -> tuple[Candidate | None, dict[str, Any]]:
+    """1:1 이미지-JSON 쌍을 독립 검증한다(멀티프로세스 워커).
+
+    공유 상태를 만지지 않고 (candidate, row)만 반환한다. 순서 의존 병합
+    (픽셀 중복 제거, 계통 오류 누적, 감사 순서)은 메인이 정렬 순서대로
+    직렬 수행하므로 병렬/직렬 산출물과 raw fingerprint가 동일하다.
+    검증 후 사용되지 않는 label(파싱된 JSON)은 IPC 비용을 줄이려 비운다.
+    """
+    raw_root, split, modality, stem, image_path, json_path, config = payload
+    candidate, row = _validate_pair(
+        raw_root, split, modality, stem, image_path, json_path, config
+    )
+    if candidate is not None:
+        candidate.label = {}
+    return candidate, row
+
+
 def _preflight(
     raw_root: Path,
     groups: dict[tuple[str, str, str], dict[str, list[Path]]],
@@ -274,6 +299,36 @@ def scan(
 ) -> tuple[list[Candidate], list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     groups, discovered = _index_raw(raw_root, logger)
     _preflight(raw_root, groups, config)
+    sorted_groups = sorted(groups.items())
+    pair_keys: list[tuple[str, str, str]] = []
+    pair_payloads: list[tuple[Path, str, str, str, Path, Path, dict[str, Any]]] = []
+    for key, group in sorted_groups:
+        if len(group["images"]) == 1 and len(group["json"]) == 1:
+            split, modality, _ = key
+            stem = group["images"][0].stem
+            pair_keys.append(key)
+            pair_payloads.append(
+                (raw_root, split, modality, stem, group["images"][0], group["json"][0], config)
+            )
+    jobs = _scan_jobs(config)
+    if logger:
+        logger.info(
+            "쌍 검증 시작 | pair %s | worker %s",
+            f"{len(pair_payloads):,}",
+            jobs,
+        )
+    results_by_key: dict[tuple[str, str, str], tuple[Candidate | None, dict[str, Any]]] = {}
+    if jobs > 1 and pair_payloads:
+        chunk = max(1, len(pair_payloads) // (jobs * 8))
+        with ProcessPoolExecutor(max_workers=jobs) as executor:
+            for key, result in zip(
+                pair_keys,
+                executor.map(_validate_pair_worker, pair_payloads, chunksize=chunk),
+            ):
+                results_by_key[key] = result
+    else:
+        for key, payload in zip(pair_keys, pair_payloads):
+            results_by_key[key] = _validate_pair_worker(payload)
     candidates: list[Candidate] = []
     audit: list[dict[str, Any]] = []
     systemic: list[str] = []
@@ -294,7 +349,7 @@ def scan(
     )
     logged = 0
     max_logged = int(config.get("max_logged_error_examples", 20))
-    for index, (key, group) in enumerate(sorted(groups.items()), 1):
+    for index, (key, group) in enumerate(sorted_groups, 1):
         split, modality, folded_stem = key
         paths = group["images"] + group["json"]
         stem = paths[0].stem if paths else folded_stem
@@ -346,15 +401,7 @@ def scan(
             audit.append(row)
             orphans.append(row)
         else:
-            candidate, row = _validate_pair(
-                raw_root,
-                split,
-                modality,
-                stem,
-                group["images"][0],
-                group["json"][0],
-                config,
-            )
+            candidate, row = results_by_key[key]
             if candidate is not None:
                 duplicate = seen_pixels.get((modality, candidate.pixel_hash))
                 if duplicate:
@@ -364,10 +411,11 @@ def scan(
                 else:
                     seen_pixels[(modality, candidate.pixel_hash)] = stem
                     candidates.append(candidate)
-            if row["validation_status"] == "excluded_source" and row["exclusion_reason"] not in {
-                "ct_porosity_bbox_max_ratio_ge_0.25"
+            reason = str(row["exclusion_reason"]).split(":", 1)[0]
+            if row["validation_status"] == "excluded_source" and reason not in {
+                "ct_porosity_bbox_max_ratio_ge_0.25",
+                "duplicate_pixel_hash",
             }:
-                reason = str(row["exclusion_reason"]).split(":", 1)[0]
                 error_counts[reason] += 1
                 consecutive = consecutive + 1 if reason == last_error else 1
                 last_error = reason
