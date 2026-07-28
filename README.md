@@ -156,6 +156,32 @@ adjust parameters and regenerate the entire case
 개별 반려 샷만 교체하는 것은 허용되지 않는다. 반려가 나왔다는 건 그 case의 생성 로직
 자체가 약하다는 뜻이고, 표본에 안 걸린 나머지 장도 같은 문제를 갖고 있기 때문이다.
 
+### 미달 case만 재생성하기 — `--drop-cases`
+
+40,000장을 전부 다시 만들면 나머지 case의 검수 결과까지 버려지고 510장을 다시 검수해야
+한다. `--drop-cases`는 지정한 failure case의 커밋된 샘플만 manifest에서 지워, `--resume`이
+그 case만 다시 만들게 한다.
+
+```powershell
+quality-fail-augment generate `
+  --raw-root "E:\103.배터리 불량 이미지 데이터" `
+  --config ".\config.40k.measured.json" `
+  --plan "E:\quality_fail_40k_plan2_v1.5\manifests\generation_plan.csv" `
+  --output "E:\quality_fail_40k_v1.5" `
+  --resume --trust-plan `
+  --drop-cases rgb_trigger_timing_failure,rgb_uneven_lighting
+```
+
+파일은 이 옵션이 직접 지우지 않는다. manifest에서 행이 사라지면 기존 복구 경로
+(`_cleanup_uncommitted`)가 그 파일들을 "manifest 없는 부분 출력"으로 보고 정리하며,
+그 내역은 `manifests/recovery_audit.csv`에 남는다.
+
+재생성된 샘플은 plan에서 나오므로 **`synthetic_id`가 그대로**다. QA 표본 선택도
+`synthetic_id` 정렬 순이라 표본 ID 집합이 바뀌지 않고, 따라서 손대지 않은 case의 기존
+승인 판정을 그대로 재사용할 수 있다. 재검수는 재생성한 case의 30장씩만 하면 된다.
+
+`--resume` 없이 쓰면 거부한다. 빈 출력에는 지울 것이 없기 때문이다.
+
 ### 배포와 회수
 
 검수를 팀에 맡길 때는 다음 세 가지를 함께 넘긴다.

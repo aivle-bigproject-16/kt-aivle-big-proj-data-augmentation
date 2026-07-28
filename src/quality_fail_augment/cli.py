@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from . import __version__
+from .augment import CT_CASES, RGB_CASES
 from .generator import generate, verify_dataset
 from .planner import audit_raw, create_plan
 
@@ -12,6 +13,14 @@ from .planner import audit_raw, create_plan
 def _config(path: Path) -> dict:
     with path.open("r", encoding="utf-8-sig") as handle:
         return json.load(handle)
+
+
+def _case_set(value: str) -> set[str]:
+    cases = {item.strip() for item in value.split(",") if item.strip()}
+    unknown = sorted(cases - set(CT_CASES) - set(RGB_CASES))
+    if unknown:
+        raise argparse.ArgumentTypeError(f"Unknown failure case: {', '.join(unknown)}")
+    return cases
 
 
 def parser() -> argparse.ArgumentParser:
@@ -39,6 +48,14 @@ def parser() -> argparse.ArgumentParser:
         help="Skip the full raw re-scan and fingerprint recheck; still verifies each "
         "planned source by SHA-256",
     )
+    make.add_argument(
+        "--drop-cases",
+        type=_case_set,
+        default=set(),
+        metavar="CASE[,CASE...]",
+        help="With --resume, forget the committed samples of these failure cases so they "
+        "are regenerated. Use after visual QA rejects a case and its parameters change",
+    )
     check = commands.add_parser("verify", help="Verify an existing generated dataset")
     check.add_argument("--output", type=Path, required=True)
     return root
@@ -53,7 +70,7 @@ def main() -> None:
     elif args.command == "plan":
         result = create_plan(args.raw_root.resolve(), _config(args.config), args.output.resolve())
     elif args.command == "generate":
-        result = generate(args.raw_root.resolve(), _config(args.config), args.plan.resolve(), args.output.resolve(), args.limit_per_modality, args.resume, args.trust_plan)
+        result = generate(args.raw_root.resolve(), _config(args.config), args.plan.resolve(), args.output.resolve(), args.limit_per_modality, args.resume, args.trust_plan, args.drop_cases)
     else:
         verify_dataset(args.output.resolve())
         result = {"verified": True}
