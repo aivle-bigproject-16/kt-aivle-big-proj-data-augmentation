@@ -582,9 +582,17 @@ def _rgb_case(
         eligible: list[tuple[int, int]] = []
         object_area = result.width * result.height
         target_ratio = rng.uniform(0.01, 0.08)
+        # 반지름 상한은 프레임 크기에 비례해야 한다. v1.5 는 배터리 외곽선 면적을 기준으로
+        # 최대 80개의 입자를 뿌렸기에 6px 고정 상한이 거의 걸리지 않았지만, v1.6 이
+        # 기준을 전체 프레임으로 넓히고 입자를 14개 이하로 줄이면서 이 상한이 항상 걸리게
+        # 됐다. 그러면 위의 target_ratio 계산이 무력화되고, 1920x1080 기준 실제 커버리지가
+        # 0.00076 까지 떨어져 _quality_gate 의 하한 0.001 을 넘지 못한다.
         nominal_radius = max(
             0.5,
-            min(6.0, math.sqrt(target_ratio * object_area / (math.pi * count))),
+            min(
+                result.width * 0.04,
+                math.sqrt(target_ratio * object_area / (math.pi * count)),
+            ),
         )
         for _ in range(count):
             radius = nominal_radius * rng.uniform(0.75, 1.25)
