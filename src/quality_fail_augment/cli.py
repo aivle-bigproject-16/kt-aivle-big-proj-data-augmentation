@@ -23,6 +23,13 @@ def _case_set(value: str) -> set[str]:
     return cases
 
 
+_REUSE_SCAN_HELP = (
+    "Reuse a previous run's scan_cache.csv (or a directory containing one) instead of "
+    "re-validating every raw pair. Pairs whose image and JSON still have the same size "
+    "and mtime are taken from the cache; everything else is validated normally"
+)
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="quality-fail-augment")
     root.add_argument("--version", action="version", version=__version__)
@@ -31,10 +38,12 @@ def parser() -> argparse.ArgumentParser:
     audit.add_argument("--raw-root", type=Path, required=True)
     audit.add_argument("--config", type=Path, required=True)
     audit.add_argument("--output", type=Path, required=True)
+    audit.add_argument("--reuse-scan", type=Path, help=_REUSE_SCAN_HELP)
     plan = commands.add_parser("plan", help="Scan raw data and freeze a deterministic plan")
     plan.add_argument("--raw-root", type=Path, required=True)
     plan.add_argument("--config", type=Path, required=True)
     plan.add_argument("--output", type=Path, required=True)
+    plan.add_argument("--reuse-scan", type=Path, help=_REUSE_SCAN_HELP)
     make = commands.add_parser("generate", help="Generate from an approved plan")
     make.add_argument("--raw-root", type=Path, required=True)
     make.add_argument("--config", type=Path, required=True)
@@ -65,10 +74,18 @@ def main() -> None:
     args = parser().parse_args()
     if args.command == "audit-raw":
         result = audit_raw(
-            args.raw_root.resolve(), _config(args.config), args.output.resolve()
+            args.raw_root.resolve(),
+            _config(args.config),
+            args.output.resolve(),
+            args.reuse_scan.resolve() if args.reuse_scan else None,
         )
     elif args.command == "plan":
-        result = create_plan(args.raw_root.resolve(), _config(args.config), args.output.resolve())
+        result = create_plan(
+            args.raw_root.resolve(),
+            _config(args.config),
+            args.output.resolve(),
+            args.reuse_scan.resolve() if args.reuse_scan else None,
+        )
     elif args.command == "generate":
         result = generate(args.raw_root.resolve(), _config(args.config), args.plan.resolve(), args.output.resolve(), args.limit_per_modality, args.resume, args.trust_plan, args.drop_cases)
     else:

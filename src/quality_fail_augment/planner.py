@@ -65,10 +65,201 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> Non
     os.replace(temporary, path)
 
 
+# 실행 성능만 바꾸고 산출물 바이트에는 영향을 주지 않는 키다.
+#
+# 이 키들이 config 해시에 들어가면, smoke 가 측정한 worker_peak_rss_bytes 를 config 에
+# 넣는 순간 승인된 plan 이 무효가 되어 전체 재스캔(약 66분)을 다시 해야 한다. 계획
+# 산출물이 한 바이트도 달라지지 않는데 치르는 비용이므로 해시 재료에서 뺀다.
+#
+# 각 키가 무해한 근거:
+#   jobs, parallel_chunk_multiplier, worker_peak_rss_bytes, memory_budget_ratio,
+#   memory_probe_fallback_jobs, memory_sample_interval_seconds
+#       워커 수와 청크 크기만 정한다. 병렬·직렬 산출물과 raw fingerprint 가 동일함은
+#       _validate_pair_worker 의 계약이다.
+#   plan_log_interval, plan_checkpoint_interval, checkpoint_interval,
+#   max_logged_error_examples
+#       로그와 체크포인트 주기만 정한다.
+#   hash_chunk_bytes
+#       sha256_file 이 파일을 몇 바이트씩 읽는지만 정한다. 해시값은 같다.
+#
+# 목록에 없는 키는 전부 해시에 남는다. 새 키가 추가되면 기본적으로 plan 이 무효화되는
+# 쪽으로 동작하므로, 빠뜨렸을 때 안전한 방향으로 실패한다.
+PERFORMANCE_ONLY_KEYS = frozenset(
+    {
+        "checkpoint_interval",
+        "hash_chunk_bytes",
+        "jobs",
+        "max_logged_error_examples",
+        "memory_budget_ratio",
+        "memory_probe_fallback_jobs",
+        "memory_sample_interval_seconds",
+        "parallel_chunk_multiplier",
+        "plan_checkpoint_interval",
+        "plan_log_interval",
+        "worker_peak_rss_bytes",
+    }
+)
+
+
 def _config_hash(config: dict[str, Any]) -> str:
+    material = {key: value for key, value in config.items() if key not in PERFORMANCE_ONLY_KEYS}
     return hashlib.sha256(
-        json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+# scan 캐시 스키마 버전. _validate_pair 가 쓰는 검증 로직 — open_normalized, pixel_hash,
+# point_rings, extract_ct_roi, porosity_bbox_metric, 필수 필드 목록 — 이 바뀌면 반드시
+# 올린다. 올리지 않으면 낡은 판정을 그대로 재사용하게 된다.
+SCAN_CACHE_VERSION = "1"
+
+SCAN_CACHE_FIELDS = [
+    "cache_version",
+    "raw_split",
+    "modality",
+    "image_stem",
+    "raw_image_path",
+    "raw_json_path",
+    "image_size",
+    "image_mtime_ns",
+    "json_size",
+    "json_mtime_ns",
+    "status",
+    "image_sha256",
+    "json_sha256",
+    "pixel_hash",
+    "width",
+    "height",
+    "porosity_bbox_max_ratio",
+    "porosity_component_count",
+    "roi",
+    "exclusion_reason",
+]
+
+
+def _stat_signature(path: Path) -> tuple[str, str]:
+    info = path.stat()
+    return str(info.st_size), str(info.st_mtime_ns)
+
+
+def _load_scan_cache(path: Path) -> dict[tuple[str, str, str], dict[str, str]]:
+    """scan 캐시 CSV 를 pair key 로 색인해 읽는다.
+
+    디렉터리를 주면 그 안의 manifests/scan_cache.csv 또는 scan_cache.csv 를 찾는다.
+    """
+    if path.is_dir():
+        for nested in (path / "manifests" / "scan_cache.csv", path / "scan_cache.csv"):
+            if nested.is_file():
+                path = nested
+                break
+        else:
+            raise ValueError(f"scan cache not found under directory: {path}")
+    if not path.is_file():
+        raise ValueError(f"scan cache not found: {path}")
+    entries: dict[tuple[str, str, str], dict[str, str]] = {}
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames != SCAN_CACHE_FIELDS:
+            raise ValueError(
+                f"scan cache schema mismatch: {path}\n"
+                f"  expected: {SCAN_CACHE_FIELDS}\n  found: {reader.fieldnames}"
+            )
+        for entry in reader:
+            if entry["cache_version"] != SCAN_CACHE_VERSION:
+                raise ValueError(
+                    f"scan cache version {entry['cache_version']!r} != "
+                    f"{SCAN_CACHE_VERSION!r}; rebuild the cache: {path}"
+                )
+            key = (entry["raw_split"], entry["modality"], entry["image_stem"].casefold())
+            entries[key] = entry
+    return entries
+
+
+def _cache_fresh(entry: dict[str, str], image_path: Path, json_path: Path) -> bool:
+    """캐시 항목이 현재 원본 파일과 같은 크기·수정시각인지 본다.
+
+    sha256 재계산이 이 캐시가 없애려는 비용 자체이므로, 신선도는 stat 로만 판정한다.
+    plan 에 실제로 선택된 소스는 generate 가 sha256 으로 다시 pin 검증하므로
+    (_validate_plan), 실제 사용되는 40k 장의 무결성은 그대로 보장된다.
+    """
+    try:
+        image_size, image_mtime = _stat_signature(image_path)
+        json_size, json_mtime = _stat_signature(json_path)
+    except OSError:
+        return False
+    return (
+        entry["image_size"] == image_size
+        and entry["image_mtime_ns"] == image_mtime
+        and entry["json_size"] == json_size
+        and entry["json_mtime_ns"] == json_mtime
+    )
+
+
+def _result_from_cache(
+    entry: dict[str, str],
+    image_path: Path,
+    json_path: Path,
+    config: dict[str, Any],
+) -> tuple[Candidate | None, dict[str, Any], dict[str, Any]]:
+    """캐시 항목에서 _validate_pair 와 동일한 (candidate, audit row, cache entry) 를 만든다.
+
+    ct_porosity_threshold 는 캐시된 비율 원값에 다시 적용한다. 임계값만 바꾼 경우
+    캐시를 버리지 않아도 되도록 하기 위해서다.
+    """
+    stem = entry["image_stem"]
+    modality = entry["modality"]
+    parsed = ParsedName.parse(stem)
+    if parsed is None:
+        raise ValueError(f"invalid source stem in scan cache: {stem}")
+    base: dict[str, Any] = {
+        "modality": modality,
+        "raw_split": entry["raw_split"],
+        "image_stem": stem,
+        "battery_id": parsed.battery_id,
+        "image_id": parsed.image_id,
+        "raw_image_path": entry["raw_image_path"],
+        "raw_json_path": entry["raw_json_path"],
+    }
+    if entry["status"] != "valid":
+        return (
+            None,
+            {
+                **base,
+                "validation_status": "excluded_source",
+                "error_level": "excluded_source",
+                "exclusion_reason": entry["exclusion_reason"],
+            },
+            entry,
+        )
+    ratio = float(entry["porosity_bbox_max_ratio"])
+    excluded = modality == "CT" and ratio >= float(config["ct_porosity_threshold"])
+    row = {
+        **base,
+        "image_sha256": entry["image_sha256"],
+        "json_sha256": entry["json_sha256"],
+        "pixel_hash": entry["pixel_hash"],
+        "validation_status": "excluded_source" if excluded else "valid",
+        "error_level": "excluded_source" if excluded else "valid",
+        "exclusion_reason": ("ct_porosity_bbox_max_ratio_ge_0.25" if excluded else ""),
+        "porosity_bbox_max_ratio": f"{ratio:.8f}",
+        "ct_bbox_excluded": str(excluded).lower(),
+    }
+    candidate = Candidate(
+        entry["raw_split"],
+        image_path,
+        json_path,
+        parsed,
+        {},
+        int(entry["width"]),
+        int(entry["height"]),
+        entry["image_sha256"],
+        entry["json_sha256"],
+        entry["pixel_hash"],
+        tuple(json.loads(entry["roi"])) if entry["roi"] else None,
+        ratio,
+        int(entry["porosity_component_count"]),
+    )
+    return (None if excluded else candidate), row, entry
 
 
 def _raw_split(path: Path, root: Path) -> str | None:
@@ -143,10 +334,37 @@ def _validate_pair(
     image_path: Path,
     json_path: Path,
     config: dict[str, Any],
-) -> tuple[Candidate | None, dict[str, Any]]:
+) -> tuple[Candidate | None, dict[str, Any], dict[str, Any]]:
     parsed = ParsedName.parse(stem)
     if parsed is None:
         raise ValueError(f"invalid source stem: {stem}")
+    try:
+        image_size, image_mtime = _stat_signature(image_path)
+        json_size, json_mtime = _stat_signature(json_path)
+    except OSError:
+        image_size = image_mtime = json_size = json_mtime = ""
+    cache_entry: dict[str, Any] = {
+        "cache_version": SCAN_CACHE_VERSION,
+        "raw_split": split,
+        "modality": modality,
+        "image_stem": stem,
+        "raw_image_path": _safe_relative(image_path, raw_root),
+        "raw_json_path": _safe_relative(json_path, raw_root),
+        "image_size": image_size,
+        "image_mtime_ns": image_mtime,
+        "json_size": json_size,
+        "json_mtime_ns": json_mtime,
+        "status": "error",
+        "image_sha256": "",
+        "json_sha256": "",
+        "pixel_hash": "",
+        "width": "",
+        "height": "",
+        "porosity_bbox_max_ratio": "",
+        "porosity_component_count": "",
+        "roi": "",
+        "exclusion_reason": "",
+    }
     base: dict[str, Any] = {
         "modality": modality,
         "raw_split": split,
@@ -210,14 +428,35 @@ def _validate_pair(
             ratio,
             component_count,
         )
-        return (None if excluded else candidate), row
+        # 캐시에는 제외 판정 이전의 사실만 담는다. excluded 는 ct_porosity_threshold 를
+        # 다시 적용해 복원하므로, 임계값만 바뀐 경우 캐시가 그대로 유효하다.
+        cache_entry.update(
+            {
+                "status": "valid",
+                "image_sha256": image_hash,
+                "json_sha256": json_hash,
+                "pixel_hash": pixels,
+                "width": image.width,
+                "height": image.height,
+                "porosity_bbox_max_ratio": f"{ratio:.8f}",
+                "porosity_component_count": component_count,
+                "roi": json.dumps(roi) if roi is not None else "",
+            }
+        )
+        return (None if excluded else candidate), row, cache_entry
     except Exception as exc:
-        return None, {
-            **base,
-            "validation_status": "excluded_source",
-            "error_level": "excluded_source",
-            "exclusion_reason": f"{type(exc).__name__}: {exc}",
-        }
+        reason = f"{type(exc).__name__}: {exc}"
+        cache_entry["exclusion_reason"] = reason
+        return (
+            None,
+            {
+                **base,
+                "validation_status": "excluded_source",
+                "error_level": "excluded_source",
+                "exclusion_reason": reason,
+            },
+            cache_entry,
+        )
 
 
 def _scan_jobs(config: dict[str, Any]) -> int:
@@ -227,21 +466,21 @@ def _scan_jobs(config: dict[str, Any]) -> int:
 
 def _validate_pair_worker(
     payload: tuple[Path, str, str, str, Path, Path, dict[str, Any]]
-) -> tuple[Candidate | None, dict[str, Any]]:
+) -> tuple[Candidate | None, dict[str, Any], dict[str, Any]]:
     """1:1 이미지-JSON 쌍을 독립 검증한다(멀티프로세스 워커).
 
-    공유 상태를 만지지 않고 (candidate, row)만 반환한다. 순서 의존 병합
+    공유 상태를 만지지 않고 (candidate, row, cache entry)만 반환한다. 순서 의존 병합
     (픽셀 중복 제거, 계통 오류 누적, 감사 순서)은 메인이 정렬 순서대로
     직렬 수행하므로 병렬/직렬 산출물과 raw fingerprint가 동일하다.
     검증 후 사용되지 않는 label(파싱된 JSON)은 IPC 비용을 줄이려 비운다.
     """
     raw_root, split, modality, stem, image_path, json_path, config = payload
-    candidate, row = _validate_pair(
+    candidate, row, cache_entry = _validate_pair(
         raw_root, split, modality, stem, image_path, json_path, config
     )
     if candidate is not None:
         candidate.label = {}
-    return candidate, row
+    return candidate, row, cache_entry
 
 
 def _preflight(
@@ -269,7 +508,7 @@ def _preflight(
         errors: Counter[str] = Counter()
         for (raw_split, actual_modality, _), group in pairs:
             stem = group["images"][0].stem
-            candidate, row = _validate_pair(
+            candidate, row, _ = _validate_pair(
                 raw_root,
                 raw_split,
                 actual_modality,
@@ -296,28 +535,44 @@ def scan(
     config: dict[str, Any],
     logger=None,
     audit_checkpoint_path: Path | None = None,
+    reuse_scan: Path | None = None,
+    cache_path: Path | None = None,
 ) -> tuple[list[Candidate], list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     groups, discovered = _index_raw(raw_root, logger)
     _preflight(raw_root, groups, config)
     sorted_groups = sorted(groups.items())
+    cache = _load_scan_cache(reuse_scan) if reuse_scan else {}
+    results_by_key: dict[
+        tuple[str, str, str], tuple[Candidate | None, dict[str, Any], dict[str, Any]]
+    ] = {}
     pair_keys: list[tuple[str, str, str]] = []
     pair_payloads: list[tuple[Path, str, str, str, Path, Path, dict[str, Any]]] = []
     for key, group in sorted_groups:
         if len(group["images"]) == 1 and len(group["json"]) == 1:
             split, modality, _ = key
-            stem = group["images"][0].stem
+            image_path, json_path = group["images"][0], group["json"][0]
+            stem = image_path.stem
+            entry = cache.get(key)
+            if entry is not None and _cache_fresh(entry, image_path, json_path):
+                results_by_key[key] = _result_from_cache(entry, image_path, json_path, config)
+                continue
             pair_keys.append(key)
             pair_payloads.append(
-                (raw_root, split, modality, stem, group["images"][0], group["json"][0], config)
+                (raw_root, split, modality, stem, image_path, json_path, config)
             )
     jobs = _scan_jobs(config)
     if logger:
+        if cache:
+            logger.info(
+                "scan 캐시 적중 | 재사용 %s | 재검증 %s",
+                f"{len(results_by_key):,}",
+                f"{len(pair_payloads):,}",
+            )
         logger.info(
             "쌍 검증 시작 | pair %s | worker %s",
             f"{len(pair_payloads):,}",
             jobs,
         )
-    results_by_key: dict[tuple[str, str, str], tuple[Candidate | None, dict[str, Any]]] = {}
     if jobs > 1 and pair_payloads:
         chunk = max(1, len(pair_payloads) // (jobs * 8))
         with ProcessPoolExecutor(max_workers=jobs) as executor:
@@ -401,7 +656,7 @@ def scan(
             audit.append(row)
             orphans.append(row)
         else:
-            candidate, row = results_by_key[key]
+            candidate, row, _ = results_by_key[key]
             if candidate is not None:
                 duplicate = seen_pixels.get((modality, candidate.pixel_hash))
                 if duplicate:
@@ -442,6 +697,13 @@ def scan(
             _write_csv(audit_checkpoint_path, audit, AUDIT_FIELDS)
     if audit_checkpoint_path:
         _write_csv(audit_checkpoint_path, audit, AUDIT_FIELDS)
+    if cache_path is not None:
+        # 정렬 순서대로 써서 같은 원본이면 캐시 파일도 바이트 동일하게 나온다.
+        _write_csv(
+            cache_path,
+            [results_by_key[key][2] for key, _ in sorted_groups if key in results_by_key],
+            SCAN_CACHE_FIELDS,
+        )
     if logger:
         logger.info(
             "후보 탐색 완료 | 전체 파일 %s | pair key %s | 정상 %s",
@@ -492,13 +754,18 @@ def _fingerprint(candidates: list[Candidate], raw_root: Path) -> str:
 
 
 def audit_raw(
-    raw_root: Path, config: dict[str, Any], output: Path
+    raw_root: Path, config: dict[str, Any], output: Path, reuse_scan: Path | None = None
 ) -> dict[str, Any]:
     _validate_config(config)
     output.mkdir(parents=True, exist_ok=True)
     logger = configure_logger("quality_fail_augment.audit", output / "logs" / "audit.log")
     candidates, audit, systemic, orphans = scan(
-        raw_root, config, logger, output / "manifests" / "extraction_audit.csv"
+        raw_root,
+        config,
+        logger,
+        output / "manifests" / "extraction_audit.csv",
+        reuse_scan=reuse_scan,
+        cache_path=output / "manifests" / "scan_cache.csv",
     )
     _write_csv(output / "manifests" / "orphan_sources.csv", orphans, AUDIT_FIELDS)
     _write_csv(
@@ -525,14 +792,19 @@ def audit_raw(
 
 
 def create_plan(
-    raw_root: Path, config: dict[str, Any], output: Path
+    raw_root: Path, config: dict[str, Any], output: Path, reuse_scan: Path | None = None
 ) -> dict[str, Any]:
     _validate_config(config)
     manifests = output / "manifests"
     manifests.mkdir(parents=True, exist_ok=True)
     logger = configure_logger("quality_fail_augment.plan", output / "logs" / "plan.log")
     candidates, audit, systemic, orphans = scan(
-        raw_root, config, logger, manifests / "extraction_audit.csv"
+        raw_root,
+        config,
+        logger,
+        manifests / "extraction_audit.csv",
+        reuse_scan=reuse_scan,
+        cache_path=manifests / "scan_cache.csv",
     )
     _write_csv(manifests / "orphan_sources.csv", orphans, AUDIT_FIELDS)
     if systemic:
