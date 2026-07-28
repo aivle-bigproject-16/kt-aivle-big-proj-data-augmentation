@@ -366,8 +366,28 @@ def _rgb_case(
     mask = object_mask.copy() if object_mask is not None else None
     if case == "rgb_trigger_timing_failure":
         side = rng.choice(("left", "right", "top", "bottom"))
+        # The crop has to clip the battery, not merely trim background. Sizing the cut against
+        # the frame let a centred cylindrical cell survive intact - it covers about 11% of the
+        # frame width, so a left/right cut of 10..38% often removed only white background and
+        # the result was indistinguishable from a normal photo (7 of 30 visual QA samples were
+        # rejected for this). Put the cut plane inside the outline bounding box instead, so it
+        # always removes 15%..45% of the box along the chosen axis.
+        bbox = mask.getbbox() if mask is not None else None
         axis_size = result.width if side in {"left", "right"} else result.height
-        amount = max(1, round(axis_size * rng.uniform(0.10, 0.38)))
+        if bbox is not None:
+            left, top, right, bottom = bbox
+            bite = rng.uniform(0.15, 0.45)
+            if side == "left":
+                amount = left + bite * (right - left)
+            elif side == "right":
+                amount = (result.width - right) + bite * (right - left)
+            elif side == "top":
+                amount = top + bite * (bottom - top)
+            else:
+                amount = (result.height - bottom) + bite * (bottom - top)
+        else:
+            amount = axis_size * rng.uniform(0.10, 0.38)
+        amount = min(max(1, round(amount)), axis_size - 1)
         crop = [0, 0, result.width, result.height]
         if side == "left":
             crop[0] += amount
@@ -419,7 +439,11 @@ def _rgb_case(
         yy, xx = np.mgrid[0 : result.height, 0 : result.width]
         projection = xx * math.cos(angle) + yy * math.sin(angle)
         projection = (projection - projection.min()) / max(float(np.ptp(projection)), 1.0)
-        dark, bright = rng.uniform(0.25, 0.75), rng.uniform(1.15, 1.70)
+        # A dark gain above roughly 0.45 only tints the white background light grey, which
+        # visual QA read as evenly lit (11 of 30 samples rejected; every rejected sample had a
+        # dark gain of 0.481 or more). Draw the dark end from the range that actually reads as
+        # uneven lighting instead of relying on the gate to reject the weak draws.
+        dark, bright = rng.uniform(0.25, 0.45), rng.uniform(1.15, 1.70)
         gain = dark + (bright - dark) * projection
         array = np.asarray(result).astype(np.float32) * gain[..., None]
         result = _array_image(array, "RGB")
@@ -720,15 +744,30 @@ def validate_augmented(
             raise ValueError("quality_gate: low-resolution loss exceeded 70%")
 
     if "lighting_gradient" in record_types:
-        horizontal = abs(
-            float(luminance[:, : image.width // 2].mean())
-            - float(luminance[:, image.width // 2 :].mean())
+        # Comparing fixed left/right and top/bottom halves under-reads a diagonal gradient and
+        # measures mostly background, so the old 0.12 threshold did not separate the samples
+        # visual QA approved from the ones it rejected (both spanned 0.12..0.33). Measure along
+        # the gradient axis instead, and inside the battery outline when one is available,
+        # because that is what a reviewer actually looks at.
+        gradient = next(
+            record for record in records if record["type"] == "lighting_gradient"
         )
-        vertical = abs(
-            float(luminance[: image.height // 2].mean())
-            - float(luminance[image.height // 2 :].mean())
+        angle = math.radians(float(gradient["parameters"].get("angle_deg", 0.0)))
+        yy, xx = np.mgrid[0 : image.height, 0 : image.width]
+        projection = xx * math.cos(angle) + yy * math.sin(angle)
+        region = (
+            np.asarray(output_object_mask.convert("L")) > 0
+            if output_object_mask is not None
+            else np.zeros(projection.shape, dtype=bool)
         )
-        if max(horizontal, vertical) / max(output_mean, 1.0) < 0.12:
+        if not region.any():
+            region = np.ones(projection.shape, dtype=bool)
+        sampled = luminance[region]
+        axis = projection[region]
+        dark_side = sampled[axis <= float(np.quantile(axis, 0.20))]
+        bright_side = sampled[axis >= float(np.quantile(axis, 0.80))]
+        contrast = abs(float(bright_side.mean()) - float(dark_side.mean()))
+        if contrast / max(float(sampled.mean()), 1.0) < 0.25:
             raise ValueError("quality_gate: uneven lighting contrast is too small")
 
     if "dust_particles" in record_types:
@@ -791,4 +830,12 @@ def validate_augmented(
         if retained < minimum:
             raise ValueError(
                 f"quality_gate: outline retention {retained:.3f} is below {minimum:.2f}"
+            )
+        # The lower bound alone let retention 1.000 through, meaning the crop missed the
+        # battery entirely and the output looked like a normal photo. A trigger timing failure
+        # has to leave the cell clipped by the frame.
+        if "timing_edge_crop" in record_types and retained > 0.90:
+            raise ValueError(
+                f"quality_gate: outline retention {retained:.3f} is above 0.90; "
+                "the crop did not clip the battery"
             )

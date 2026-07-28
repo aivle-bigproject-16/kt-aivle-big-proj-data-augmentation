@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import json
+import logging
 import os
 import platform
 import shutil
@@ -434,6 +435,44 @@ def _cleanup_uncommitted(output: Path, manifest_rows: list[dict[str, str]]) -> N
     _write_csv(output / "manifests" / "recovery_audit.csv", recovery, RECOVERY_FIELDS)
 
 
+def _drop_failure_cases(
+    output: Path,
+    manifest_rows: list[dict[str, Any]],
+    lineage_rows: list[dict[str, Any]],
+    drop_cases: set[str],
+    logger: logging.Logger,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Forget the committed samples of the given failure cases so --resume rebuilds them.
+
+    Visual QA rejects a whole failure case, not individual samples, and the QA sample set is
+    keyed on synthetic_id. Dropping only the rejected case keeps every other case's approvals
+    reusable, because the regenerated samples reappear under the same synthetic_ids. The files
+    are not deleted here: once the rows are gone, _cleanup_uncommitted treats the leftovers as
+    manifest-less output and removes them through the existing recovery path.
+    """
+    dropped = {
+        row["synthetic_id"]
+        for row in manifest_rows
+        if row.get("failure_case", "") in drop_cases
+    }
+    if not dropped:
+        logger.info("삭제 대상 case 없음 | %s", ", ".join(sorted(drop_cases)))
+        return manifest_rows, lineage_rows
+    kept_manifest = [row for row in manifest_rows if row["synthetic_id"] not in dropped]
+    kept_lineage = [
+        row for row in lineage_rows if row.get("synthetic_id", "") not in dropped
+    ]
+    _write_csv(output / "manifests" / "dataset_manifest.csv", kept_manifest, DATASET_FIELDS)
+    _write_csv(output / "manifests" / "lineage_private.csv", kept_lineage, LINEAGE_FIELDS)
+    logger.info(
+        "case 재생성 대상 제외 | case %s | 샘플 %d건 | 잔여 %d건",
+        ", ".join(sorted(drop_cases)),
+        len(dropped),
+        len(kept_manifest),
+    )
+    return kept_manifest, kept_lineage
+
+
 def _effective_jobs(config: dict[str, Any], task_count: int) -> int:
     requested = max(1, int(config.get("jobs", 1)))
     measured_worker_bytes = config.get("worker_peak_rss_bytes")
@@ -555,9 +594,12 @@ def generate(
     limit_per_modality: int | None = None,
     resume: bool = False,
     trust_plan: bool = False,
+    drop_cases: set[str] | None = None,
 ) -> dict[str, Any]:
     if output.exists() and any(output.iterdir()) and not resume:
         raise ValueError(f"Output directory is not empty: {output}")
+    if drop_cases and not resume:
+        raise ValueError("--drop-cases requires --resume")
     output.mkdir(parents=True, exist_ok=True)
     logger = configure_logger("quality_fail_augment.generate", output / "logs" / "generation.log")
     rows = _read_csv(plan_path)
@@ -601,6 +643,10 @@ def generate(
         manifest_rows = _read_csv(manifest_path)
         lineage_path = output / "manifests" / "lineage_private.csv"
         lineage_rows = _read_csv(lineage_path) if lineage_path.exists() else []
+        if drop_cases:
+            manifest_rows, lineage_rows = _drop_failure_cases(
+                output, manifest_rows, lineage_rows, drop_cases, logger
+            )
         verify_dataset(output, manifest_rows)
     if resume:
         _cleanup_uncommitted(output, manifest_rows)
