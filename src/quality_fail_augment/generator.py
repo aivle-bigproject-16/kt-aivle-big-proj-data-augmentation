@@ -90,6 +90,9 @@ QA_FIELDS = [
     "augmentation_subtype",
     "synthetic_id",
     "image_path",
+    "source_filename",
+    "source_image_path",
+    "original_battery_id",
     "reviewer",
     "approved",
     "reason",
@@ -503,49 +506,51 @@ def _visual_qa_gate(
 ) -> None:
     if not bool(config.get("require_visual_qa_before_release", False)):
         return
-    per_case = int(config.get("visual_qa_samples_per_case", 30))
-    minimum_rate = float(config.get("visual_qa_min_approval_rate", 0.95))
+    per_case = int(config.get("visual_qa_samples_per_case", 10))
+    minimum_rate = float(config.get("visual_qa_min_approval_rate", 0.90))
     qa_path = output / "manifests" / "fail_visual_qa.csv"
+    lineage_path = output / "manifests" / "lineage_private.csv"
+    lineage = {
+        row["synthetic_id"]: row
+        for row in (_read_csv(lineage_path) if lineage_path.exists() else [])
+    }
     selected: list[dict[str, Any]] = []
     fail_rows = [row for row in manifest_rows if row["quality_label"] == "fail"]
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in sorted(fail_rows, key=lambda item: item["synthetic_id"]):
         grouped.setdefault((row["modality"], row["failure_case"]), []).append(row)
     for (modality, case), rows in sorted(grouped.items()):
-        if case == "ct_detector_calibration":
-            ring = [row for row in rows if "ring_artifact" in row["augmentations"]]
-            stripe = [
-                row
-                for row in rows
-                if "detector_stripe_artifact" in row["augmentations"]
-            ]
-            if len(ring) < 15 or len(stripe) < 15:
-                raise ValueError(
-                    "visual QA sampling requires at least 15 CT ring and 15 stripe outputs"
-                )
-            case_selection = ring[:15] + stripe[:15]
-        else:
-            if len(rows) < per_case:
-                raise ValueError(
-                    f"visual QA sampling requires {per_case} outputs for {modality}/{case}, "
-                    f"found {len(rows)}"
-                )
-            case_selection = rows[:per_case]
-        for row in case_selection:
-            subtype = (
-                "ring"
-                if "ring_artifact" in row["augmentations"]
-                else "stripe"
-                if "detector_stripe_artifact" in row["augmentations"]
-                else ""
+        if len(rows) < per_case:
+            raise ValueError(
+                f"visual QA sampling requires {per_case} outputs for {modality}/{case}, "
+                f"found {len(rows)}"
             )
+        # Include each generated internal-stage signature before filling the remaining slots.
+        # This keeps optional on/off paths visible to human QA without making selection random.
+        by_subtype: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            by_subtype.setdefault(row.get("augmentations", ""), []).append(row)
+        case_selection = [items[0] for _, items in sorted(by_subtype.items())]
+        selected_ids = {row["synthetic_id"] for row in case_selection}
+        case_selection.extend(
+            row
+            for row in rows
+            if row["synthetic_id"] not in selected_ids
+        )
+        case_selection = case_selection[:per_case]
+        for row in case_selection:
+            source = lineage.get(row["synthetic_id"], {})
+            source_path = source.get("raw_image_path", "")
             selected.append(
                 {
                     "modality": modality,
                     "failure_case": case,
-                    "augmentation_subtype": subtype,
+                    "augmentation_subtype": row.get("augmentations", ""),
                     "synthetic_id": row["synthetic_id"],
                     "image_path": row["image_path"],
+                    "source_filename": Path(source_path).name,
+                    "source_image_path": source_path,
+                    "original_battery_id": source.get("original_battery_id", ""),
                     "reviewer": "",
                     "approved": "",
                     "reason": "",
@@ -558,12 +563,23 @@ def _visual_qa_gate(
             "and rerun with --resume"
         )
     reviewed = _read_csv(qa_path)
+    selected_by_id = {row["synthetic_id"]: row for row in selected}
     expected_ids = {row["synthetic_id"] for row in selected}
     actual_ids = {row["synthetic_id"] for row in reviewed}
     if actual_ids != expected_ids:
         raise ValueError("Visual QA CSV sample IDs differ from the deterministic QA selection")
     approvals: dict[tuple[str, str], list[bool]] = {}
     for row in reviewed:
+        expected = selected_by_id[row["synthetic_id"]]
+        for field in ("source_filename", "source_image_path", "original_battery_id"):
+            if not row.get(field, "").strip():
+                raise ValueError(
+                    f"Visual QA lineage field is empty: {row['synthetic_id']} / {field}"
+                )
+            if row[field].strip() != str(expected[field]).strip():
+                raise ValueError(
+                    f"Visual QA lineage field changed: {row['synthetic_id']} / {field}"
+                )
         value = row.get("approved", "").strip().casefold()
         if value not in {"true", "false", "yes", "no", "1", "0"}:
             raise ValueError(
@@ -912,7 +928,7 @@ def generate(
         output / "generation_summary.json",
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True).encode(),
     )
-    archive_path = output / "augmentation_json_4k_v1.5.zip"
+    archive_path = output / "augmentation_json_4k_v1.6.zip"
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(output.glob("*/*/augmentation_json/*.augmentation.json")):
             archive.write(path, path.relative_to(output).as_posix())

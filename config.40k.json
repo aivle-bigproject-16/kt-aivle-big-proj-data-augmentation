@@ -4,14 +4,11 @@
   "ct_test_target": 1000,
   "ct_test_fail_target": 100,
   "ct_failure_case_quotas": {
-    "ct_positioning_failure": 320,
-    "ct_fixation_motion": 280,
-    "ct_detector_calibration": 240,
-    "ct_low_xray_output": 280,
-    "ct_high_xray_output": 240,
-    "ct_low_resolution": 280,
-    "ct_sparse_projection_aliasing": 180,
-    "ct_photon_starvation": 180
+    "ct_cell_alignment_failure": 400,
+    "ct_acquisition_motion": 400,
+    "ct_insufficient_projection_sampling": 400,
+    "ct_low_signal_noise": 400,
+    "ct_beam_hardening_metal_streak": 400
   },
   "rgb_target": 20000,
   "rgb_augmented_target": 2000,
@@ -50,7 +47,7 @@
   "systemic_consecutive_limit": 20,
   "systemic_cumulative_limit": 100,
   "ct_porosity_threshold": 0.25,
-  "ct_bbox_policy_version": "v1.5_full_precision_ge_0.25",
+  "ct_bbox_policy_version": "v1.6_full_precision_ge_0.25",
   "ct_battery_id_start": 1900000001,
   "ct_battery_id_end": 1900100000,
   "rgb_battery_id_start": 1900100001,
@@ -63,7 +60,7 @@
   "memory_sample_interval_seconds": 0.5,
   "memory_probe_fallback_jobs": 1,
   "require_visual_qa_before_release": true,
-  "visual_qa_samples_per_case": 30,
-  "visual_qa_min_approval_rate": 0.95,
+  "visual_qa_samples_per_case": 10,
+  "visual_qa_min_approval_rate": 0.90,
   "hash_chunk_bytes": 1048576
 }

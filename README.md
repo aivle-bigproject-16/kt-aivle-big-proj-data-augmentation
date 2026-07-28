@@ -1,6 +1,6 @@
-# quality-fail-augment 1.5
+# quality-fail-augment 1.6
 
-`CT RGB 품질 PASS FAIL 독립 데이터셋 생성 계획서 v1.5`의 실행 코드다.
+`CT RGB 품질 PASS FAIL 독립 데이터셋 생성 계획서 v1.6`의 실행 코드다.
 
 원본 배터리 이미지에서 PASS 샘플과 **인위적으로 촬영 결함을 주입한 FAIL 샘플**을 만들어,
 품질 판정 모델이 학습할 40,000장 규모의 데이터셋을 결정론적으로 생성한다.
@@ -34,7 +34,7 @@ ID, 파일명, 출력 크기, `quality_class`, 변환된 polygon 좌표를 갖�
 [4] generate    plan 대로 40,000장 생성 → 자동 검증 → 사람 visual QA 게이트에서 정지
        ↓        산출: 이미지·라벨·이력 전량, manifests/, fail_visual_qa.csv
 [5] resume      사람이 채운 QA CSV 를 검사 → 통과하면 최종 산출물 공개
-       ↓        산출: generation_summary.json, augmentation_json_4k_v1.5.zip
+       ↓        산출: generation_summary.json, augmentation_json_4k_v1.6.zip
 [6] upload      원격 저장소로 전송
 ```
 
@@ -94,7 +94,7 @@ generator._make_one()
 |---|---|---|
 | 위치 | `augment.py` `_quality_gate()` | `generator.py` `_visual_qa_gate()` |
 | 시점 | 샘플 1장을 만들 때마다 | 40,000장을 다 만든 뒤 1회 |
-| 검사 대상 | 그 장의 픽셀 통계 | case별 표본 30장의 육안 인상 |
+| 검사 대상 | 그 장의 픽셀 통계 | case별 표본 10장의 육안 인상 |
 | 판정 기준 | 수치 임계값 (예: 엣지 손실 30~80%) | 사람이 "이게 FAIL로 보이는가" |
 | 실패 시 | 같은 case로 최대 8회 재시도 → reserve source로 교체 | 해당 case 전체 재생성 |
 
@@ -111,16 +111,18 @@ generator._make_one()
 ### 무엇을 하는 게이트인가
 
 `generate`가 40,000장을 다 만들고 자동 검증까지 끝내면, 마지막으로 FAIL 샘플 중 **case별
-30장**을 결정론적으로 뽑아 `manifests/fail_visual_qa.csv`를 만들고 **실행을 중단한다**
+10장**을 결정론적으로 뽑아 `manifests/fail_visual_qa.csv`를 만들고 **실행을 중단한다**
 (종료 코드 10, 메시지 `Visual QA approval pending`).
 
-- CT 8개 case × 30장 = 240장
-- RGB 9개 case × 30장 = 270장
-- 합계 **510장**
-- 단 `ct_detector_calibration`은 하위 유형이 둘이라 ring 15장 + stripe 15장으로 나눠 뽑는다
+- CT 5개 case × 10장 = 50장
+- RGB 9개 case × 10장 = 90장
+- 합계 **140장**
 
-표본은 `synthetic_id` 정렬 순 상위 30개로 고정이다. 무작위가 아니므로 같은 데이터셋이면
-같은 510장이 뽑히고, 재생성해도 `synthetic_id`가 유지되면 표본도 그대로다.
+표본은 `synthetic_id` 정렬 순 상위 10개로 고정이다. 무작위가 아니므로 같은 데이터셋이면
+같은 140장이 뽑히고, 재생성해도 `synthetic_id`가 유지되면 표본도 그대로다.
+
+QA CSV에는 증강본 경로뿐 아니라 `source_filename`, `source_image_path`,
+`original_battery_id`를 기록해 검수자가 원본 계보를 확인할 수 있게 한다.
 
 ### 검수자가 할 일
 
@@ -142,13 +144,13 @@ CSV는 UTF-8(BOM 포함)로 읽으므로 Excel에서 편집해 저장해도 무�
 
 ### 통과 기준
 
-**case별 승인율 95% 이상**(`visual_qa_min_approval_rate`). case당 30장이므로 실질적으로
-**case당 반려 1장까지 허용**되고, 2장부터 그 case는 실패다.
+**case별 승인율 90% 이상**(`visual_qa_min_approval_rate`). case당 10장이므로
+**9장 이상 승인**, 즉 case당 반려 1장까지 허용되고 2장부터 그 case는 실패다.
 
 승인율이 미달이면 `resume`이 다음 메시지로 중단한다.
 
 ```text
-Visual QA approval below 95% for RGB/rgb_uneven_lighting: 63.33%;
+Visual QA approval below 90% for RGB/rgb_uneven_lighting: 80.00%;
 adjust parameters and regenerate the entire case
 ```
 
@@ -158,7 +160,7 @@ adjust parameters and regenerate the entire case
 
 ### 미달 case만 재생성하기 — `--drop-cases`
 
-40,000장을 전부 다시 만들면 나머지 case의 검수 결과까지 버려지고 510장을 다시 검수해야
+40,000장을 전부 다시 만들면 나머지 case의 검수 결과까지 버려지고 140장을 다시 검수해야
 한다. `--drop-cases`는 지정한 failure case의 커밋된 샘플만 manifest에서 지워, `--resume`이
 그 case만 다시 만들게 한다.
 
@@ -166,8 +168,8 @@ adjust parameters and regenerate the entire case
 quality-fail-augment generate `
   --raw-root "E:\103.배터리 불량 이미지 데이터" `
   --config ".\config.40k.measured.json" `
-  --plan "E:\quality_fail_40k_plan2_v1.5\manifests\generation_plan.csv" `
-  --output "E:\quality_fail_40k_v1.5" `
+  --plan "E:\quality_fail_40k_plan2_v1.6\manifests\generation_plan.csv" `
+  --output "E:\quality_fail_40k_v1.6" `
   --resume --trust-plan `
   --drop-cases rgb_trigger_timing_failure,rgb_uneven_lighting
 ```
@@ -178,7 +180,7 @@ quality-fail-augment generate `
 
 재생성된 샘플은 plan에서 나오므로 **`synthetic_id`가 그대로**다. QA 표본 선택도
 `synthetic_id` 정렬 순이라 표본 ID 집합이 바뀌지 않고, 따라서 손대지 않은 case의 기존
-승인 판정을 그대로 재사용할 수 있다. 재검수는 재생성한 case의 30장씩만 하면 된다.
+승인 판정을 그대로 재사용할 수 있다. 재검수는 재생성한 case의 10장씩만 하면 된다.
 
 `--resume` 없이 쓰면 거부한다. 빈 출력에는 지울 것이 없기 때문이다.
 
@@ -187,7 +189,7 @@ quality-fail-augment generate `
 검수를 팀에 맡길 때는 다음 세 가지를 함께 넘긴다.
 
 - `manifests/fail_visual_qa.csv` (빈 상태)
-- 표본 510장의 이미지
+- 표본 140장의 이미지
 - 위 판정 기준
 
 검수자가 채운 CSV를 받아 `manifests/fail_visual_qa.csv` 자리에 덮어쓰고 `--resume`으로
@@ -196,7 +198,7 @@ quality-fail-augment generate `
 ## 설치
 
 ```powershell
-cd "quality_fail_augment_code_v1.5"
+cd "quality_fail_augment_code_v1.6"
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
@@ -204,7 +206,7 @@ python -m pip install -e .
 quality-fail-augment --version
 ```
 
-버전 출력은 정확히 `1.5`여야 한다.
+버전 출력은 정확히 `1.6`이어야 한다.
 
 ## 실행
 
@@ -214,7 +216,7 @@ quality-fail-augment --version
 quality-fail-augment audit-raw `
   --raw-root "E:\103.배터리 불량 이미지 데이터" `
   --config ".\config.40k.json" `
-  --output "E:\quality_fail_raw_audit_v1.5"
+  --output "E:\quality_fail_raw_audit_v1.6"
 ```
 
 결정론적 source, output slot, main/test, failure case를 고정한다.
@@ -223,7 +225,7 @@ quality-fail-augment audit-raw `
 quality-fail-augment plan `
   --raw-root "E:\103.배터리 불량 이미지 데이터" `
   --config ".\config.40k.json" `
-  --output "E:\quality_fail_40k_plan_v1.5"
+  --output "E:\quality_fail_40k_plan_v1.6"
 ```
 
 소규모 시험 생성:
@@ -232,8 +234,8 @@ quality-fail-augment plan `
 quality-fail-augment generate `
   --raw-root "E:\103.배터리 불량 이미지 데이터" `
   --config ".\config.40k.json" `
-  --plan "E:\quality_fail_40k_plan_v1.5\manifests\generation_plan.csv" `
-  --output "E:\quality_fail_40k_smoke_v1.5" `
+  --plan "E:\quality_fail_40k_plan_v1.6\manifests\generation_plan.csv" `
+  --output "E:\quality_fail_40k_smoke_v1.6" `
   --limit-per-modality 100
 ```
 
@@ -250,13 +252,13 @@ quality-fail-augment generate `
 quality-fail-augment generate `
   --raw-root "E:\103.배터리 불량 이미지 데이터" `
   --config ".\config.40k.json" `
-  --plan "E:\quality_fail_40k_plan_v1.5\manifests\generation_plan.csv" `
-  --output "E:\quality_fail_40k_v1.5"
+  --plan "E:\quality_fail_40k_plan_v1.6\manifests\generation_plan.csv" `
+  --output "E:\quality_fail_40k_v1.6"
 ```
 
 전체 파일 생성·자동 검증 뒤에는 `manifests/fail_visual_qa.csv`가 생성되고 첫
 실행이 `Visual QA approval pending`으로 중단된다. 위 "visual QA 게이트" 절의 기준대로
-510장을 검수해 CSV를 채운 뒤 재개한다.
+140장을 검수해 CSV를 채운 뒤 재개한다.
 
 재개:
 
@@ -264,8 +266,8 @@ quality-fail-augment generate `
 quality-fail-augment generate `
   --raw-root "E:\103.배터리 불량 이미지 데이터" `
   --config ".\config.40k.json" `
-  --plan "E:\quality_fail_40k_plan_v1.5\manifests\generation_plan.csv" `
-  --output "E:\quality_fail_40k_v1.5" `
+  --plan "E:\quality_fail_40k_plan_v1.6\manifests\generation_plan.csv" `
+  --output "E:\quality_fail_40k_v1.6" `
   --resume
 ```
 
@@ -275,7 +277,7 @@ quality-fail-augment generate `
 검증:
 
 ```powershell
-quality-fail-augment verify --output "E:\quality_fail_40k_v1.5"
+quality-fail-augment verify --output "E:\quality_fail_40k_v1.6"
 ```
 
 ## 자동 파이프라인 (`run_pipeline.ps1`)
@@ -290,32 +292,32 @@ quality-fail-augment verify --output "E:\quality_fail_40k_v1.5"
 # 1) 병렬 scan 으로 plan 생성
 pwsh -File .\run_pipeline.ps1 -Stage plan `
   -RawRoot "E:\103.배터리 불량 이미지 데이터" -Config .\config.40k.json `
-  -Output "E:\quality_fail_40k_plan_v1.5" -Detached
+  -Output "E:\quality_fail_40k_plan_v1.6" -Detached
 
 # 2) smoke 로 worker_peak_rss_bytes 측정 → config.40k.measured.json 자동 생성
 pwsh -File .\run_pipeline.ps1 -Stage smoke `
   -RawRoot "E:\103.배터리 불량 이미지 데이터" -Config .\config.40k.json `
-  -Plan "E:\quality_fail_40k_plan_v1.5\manifests\generation_plan.csv" `
-  -Output "E:\quality_fail_40k_smoke_v1.5" -Detached
+  -Plan "E:\quality_fail_40k_plan_v1.6\manifests\generation_plan.csv" `
+  -Output "E:\quality_fail_40k_smoke_v1.6" -Detached
 
 # 3) 측정 config 로 plan 을 다시 만든 뒤 full 생성. QA 게이트에서 멈춘다(exit=10).
 pwsh -File .\run_pipeline.ps1 -Stage generate `
   -RawRoot "E:\103.배터리 불량 이미지 데이터" -Config .\config.40k.measured.json `
-  -Plan "E:\quality_fail_40k_plan2_v1.5\manifests\generation_plan.csv" `
-  -Output "E:\quality_fail_40k_v1.5" -Detached
+  -Plan "E:\quality_fail_40k_plan2_v1.6\manifests\generation_plan.csv" `
+  -Output "E:\quality_fail_40k_v1.6" -Detached
 
 # 4) 사람이 fail_visual_qa.csv 를 채운 뒤 재개 → 최종 ZIP 공개
 pwsh -File .\run_pipeline.ps1 -Stage resume `
   -RawRoot "E:\103.배터리 불량 이미지 데이터" -Config .\config.40k.measured.json `
-  -Plan "E:\quality_fail_40k_plan2_v1.5\manifests\generation_plan.csv" `
-  -Output "E:\quality_fail_40k_v1.5" -Detached
+  -Plan "E:\quality_fail_40k_plan2_v1.6\manifests\generation_plan.csv" `
+  -Output "E:\quality_fail_40k_v1.6" -Detached
 
 # 5) 원격(gdrive 등) 업로드
 pwsh -File .\run_pipeline.ps1 -Stage upload `
-  -Output "E:\quality_fail_40k_v1.5" -Remote "gdrive:quality_fail_40k_v1.5" -Detached
+  -Output "E:\quality_fail_40k_v1.6" -Remote "gdrive:quality_fail_40k_v1.6" -Detached
 ```
 
-`generate`가 끝나면 visual-QA 게이트에서 `exit=10`으로 멈추며, 사람이 510장을 검토해
+`generate`가 끝나면 visual-QA 게이트에서 `exit=10`으로 멈추며, 사람이 140장을 검토해
 `manifests\fail_visual_qa.csv`의 `reviewer`와 `approved`를 채워야 한다. 스크립트는 이 사람
 검토를 대신 수행하지 않는다. `upload`는 `rclone`이 설치되고 원격이 설정돼 있어야 하며,
 매니페스트와 summary를 먼저 올린 뒤 augmentation ZIP과 이미지·라벨 트리를 올린다.
@@ -342,7 +344,7 @@ smoke 기준으로 재스캔 포함 약 53분이 `-TrustPlan`에서는 약 3분�
 - 생성 실패는 같은 case로 재시도하고 같은 modality의 reserve source로 교체한다.
 - reserve까지 소진하면 전체 생성을 실패 처리한다.
 - PASS는 2파일, FAIL은 3파일을 staging에서 검증한 뒤 manifest에 commit한다.
-- visual QA 승인율이 case별 95% 미만이면 릴리스 산출물을 만들지 않는다.
+- visual QA 승인율이 case별 90% 미만이면 릴리스 산출물을 만들지 않는다.
 
 ## 작업 기록
 

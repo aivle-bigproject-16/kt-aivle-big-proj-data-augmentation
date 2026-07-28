@@ -20,7 +20,19 @@ from test_contract import _config, _label, _write_raw
 
 class SchemaGateTests(unittest.TestCase):
     def test_version_is_exactly_plan_version(self) -> None:
-        self.assertEqual(__version__, "1.5")
+        self.assertEqual(__version__, "1.6")
+
+    def test_v16_ct_failure_cases_are_the_only_supported_ct_cases(self) -> None:
+        self.assertEqual(
+            CT_CASES,
+            (
+                "ct_cell_alignment_failure",
+                "ct_acquisition_motion",
+                "ct_insufficient_projection_sampling",
+                "ct_low_signal_noise",
+                "ct_beam_hardening_metal_streak",
+            ),
+        )
 
     def test_conflicting_roi_locations_are_rejected(self) -> None:
         payload = _label("CT_cell_pouch_1_x_1.png", 1, 1, "CT")
@@ -107,6 +119,28 @@ class FailureCaseTests(unittest.TestCase):
             self.assertEqual(result.failure_case, case)
             self.assertGreaterEqual(len(result.records), 1)
             self.assertTrue(np.isfinite(np.asarray(result.image)).all())
+
+    def test_lens_contamination_and_glare_use_v16_record_types(self) -> None:
+        image = Image.new("RGB", (128, 96), (90, 120, 160))
+        object_mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(object_mask).rectangle((36, 8, 92, 88), fill=255)
+        defect_mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(defect_mask).rectangle((55, 38, 70, 58), fill=255)
+        expected = {
+            "rgb_surface_dust": "lens_dust_shadow",
+            "rgb_hair_contamination": "lens_fiber_shadow",
+            "rgb_reflection_glare": "surface_aware_specular_reflection",
+        }
+        for index, (case, record_type) in enumerate(expected.items()):
+            result = apply_failure_case(
+                image,
+                "RGB",
+                case,
+                6000 + index,
+                object_mask=object_mask,
+                defect_mask=defect_mask,
+            )
+            self.assertIn(record_type, {record["type"] for record in result.records})
 
 
 if __name__ == "__main__":
