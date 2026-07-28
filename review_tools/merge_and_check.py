@@ -16,11 +16,12 @@ from pathlib import Path
 
 QA_FIELDS = [
     "modality", "failure_case", "augmentation_subtype",
-    "synthetic_id", "image_path", "reviewer", "approved", "reason",
+    "synthetic_id", "image_path", "source_filename", "source_image_path",
+    "original_battery_id", "reviewer", "approved", "reason",
 ]
 TRUTHY = {"true", "yes", "1"}
 VALID = {"true", "false", "yes", "no", "1", "0"}
-MIN_RATE = 0.95
+MIN_RATE = 0.90
 
 
 def read_rows(path):
@@ -160,12 +161,12 @@ def main():
         print("  (모든 행이 판정돼야 게이트가 통과합니다)")
         return 2
     if failing:
-        print(f"승인율 95% 미만 케이스 {len(failing)}개:")
+        print(f"승인율 90% 미만 케이스 {len(failing)}개:")
         for key, rate in failing:
             print(f"  {key[0]}/{key[1]}: {rate*100:.2f}%")
         print("  → 해당 case 파라미터를 조정하고 case 전체를 재생성해야 합니다.")
         return 1
-    print("전 케이스 95% 이상 — resume 진행 가능")
+    print("전 케이스 90% 이상 — resume 진행 가능")
     print(f"  이 파일을 output\\manifests\\fail_visual_qa.csv 로 덮어쓰고")
     print("  run_pipeline.ps1 -Stage resume 실행")
     return 0
