@@ -56,6 +56,7 @@ param(
     [string]$Output,
     [string]$Remote,
     [int]$LimitPerModality = 100,
+    [string]$DropCases,
     [switch]$TrustPlan,
     [switch]$KeepDisplay,
     [switch]$Detached
@@ -69,7 +70,7 @@ $ErrorActionPreference = "Stop"
 if ($Detached) {
     function Quote([string]$value) { '"' + $value + '"' }
     $forward = @("-ExecutionPolicy", "Bypass", "-NonInteractive", "-File", (Quote $PSCommandPath), "-Stage", $Stage)
-    foreach ($name in @("RawRoot", "Config", "Plan", "Output", "Remote")) {
+    foreach ($name in @("RawRoot", "Config", "Plan", "Output", "Remote", "DropCases")) {
         $value = Get-Variable -Name $name -ValueOnly -ErrorAction SilentlyContinue
         if ($value) { $forward += @("-$name", (Quote $value)) }
     }
@@ -178,6 +179,8 @@ switch ($Stage) {
         if (-not $RawRoot -or -not $Config -or -not $Plan) { Write-Error "-RawRoot·-Config·-Plan 필요"; exit 2 }
         $cliArgs = @("generate", "--raw-root", $RawRoot, "--config", $Config, "--plan", $Plan, "--output", $Output, "--resume")
         if ($TrustPlan) { $cliArgs += "--trust-plan" }
+        # visual QA 가 특정 case 를 반려했을 때, 그 case 만 다시 만들기 위해 넘긴다.
+        if ($DropCases) { $cliArgs += @("--drop-cases", $DropCases) }
     }
     "verify" {
         $cliArgs = @("verify", "--output", $Output)
