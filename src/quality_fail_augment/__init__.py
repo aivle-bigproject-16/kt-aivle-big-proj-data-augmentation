@@ -1,3 +1,3 @@
 """CT/RGB quality PASS-FAIL dataset builder."""
 
-__version__ = "1.6"
+__version__ = "1.7"

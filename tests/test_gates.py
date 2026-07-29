@@ -20,7 +20,7 @@ from test_contract import _config, _label, _write_raw
 
 class SchemaGateTests(unittest.TestCase):
     def test_version_is_exactly_plan_version(self) -> None:
-        self.assertEqual(__version__, "1.6")
+        self.assertEqual(__version__, "1.7")
 
     def test_v16_ct_failure_cases_are_the_only_supported_ct_cases(self) -> None:
         self.assertEqual(
@@ -120,7 +120,8 @@ class FailureCaseTests(unittest.TestCase):
             self.assertGreaterEqual(len(result.records), 1)
             self.assertTrue(np.isfinite(np.asarray(result.image)).all())
 
-    def test_lens_contamination_and_glare_use_v16_record_types(self) -> None:
+    def test_v17_case_set_and_record_types(self) -> None:
+        self.assertNotIn("rgb_alignment_failure", RGB_CASES)
         image = Image.new("RGB", (128, 96), (90, 120, 160))
         object_mask = Image.new("L", image.size, 0)
         ImageDraw.Draw(object_mask).rectangle((36, 8, 92, 88), fill=255)
@@ -130,6 +131,7 @@ class FailureCaseTests(unittest.TestCase):
             "rgb_surface_dust": "lens_dust_shadow",
             "rgb_hair_contamination": "lens_fiber_shadow",
             "rgb_reflection_glare": "surface_aware_specular_reflection",
+            "rgb_underexposure": "linear_exposure_reduction",
         }
         for index, (case, record_type) in enumerate(expected.items()):
             result = apply_failure_case(
@@ -141,6 +143,23 @@ class FailureCaseTests(unittest.TestCase):
                 defect_mask=defect_mask,
             )
             self.assertIn(record_type, {record["type"] for record in result.records})
+
+    def test_trigger_crop_preserves_source_aspect_ratio(self) -> None:
+        image = Image.new("RGB", (160, 90), (120, 140, 160))
+        object_mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(object_mask).rectangle((55, 10, 105, 80), fill=255)
+        result = apply_failure_case(
+            image,
+            "RGB",
+            "rgb_trigger_timing_failure",
+            20260729,
+            object_mask=object_mask,
+        )
+        self.assertAlmostEqual(
+            result.image.width / result.image.height,
+            image.width / image.height,
+            delta=0.02,
+        )
 
 
 if __name__ == "__main__":

@@ -20,7 +20,6 @@ CT_CASES = (
 )
 RGB_CASES = (
     "rgb_trigger_timing_failure",
-    "rgb_alignment_failure",
     "rgb_uneven_lighting",
     "rgb_reflection_glare",
     "rgb_focus_failure",
@@ -36,7 +35,6 @@ CASE_NAMES_KO = {
     "ct_low_signal_noise": "저신호 촬영",
     "ct_beam_hardening_metal_streak": "고밀도 부품 투과·보정 실패",
     "rgb_trigger_timing_failure": "배터리 감지·트리거 실패",
-    "rgb_alignment_failure": "배터리 위치 정렬 실패",
     "rgb_uneven_lighting": "조명 점등 실패",
     "rgb_reflection_glare": "반사 억제 실패",
     "rgb_focus_failure": "카메라 초점 설정 실패",
@@ -45,12 +43,7 @@ CASE_NAMES_KO = {
     "rgb_surface_dust": "렌즈·보호유리 먼지 오염",
     "rgb_hair_contamination": "렌즈·보호유리 섬유 오염",
 }
-SOURCE_REFERENCES = {
-    **{case: f"v1.6:{case}" for case in CT_CASES},
-    **{case: f"rgb_table:{index}" for index, case in enumerate(RGB_CASES[:7], 1)},
-    "rgb_surface_dust": "v1.6:lens_dust_contamination",
-    "rgb_hair_contamination": "v1.6:lens_fiber_contamination",
-}
+SOURCE_REFERENCES = {case: f"v1.7:{case}" for case in (*CT_CASES, *RGB_CASES)}
 
 
 @dataclass
@@ -142,6 +135,25 @@ def _noise(image: Image.Image, rng: np.random.Generator, sigma: float, monochrom
     return _array_image(array + noise, image.mode)
 
 
+def _srgb_to_linear(array: np.ndarray) -> np.ndarray:
+    normalized = np.clip(array.astype(np.float32) / 255.0, 0.0, 1.0)
+    return np.where(
+        normalized <= 0.04045,
+        normalized / 12.92,
+        ((normalized + 0.055) / 1.055) ** 2.4,
+    )
+
+
+def _linear_to_srgb(array: np.ndarray) -> np.ndarray:
+    clipped = np.clip(array, 0.0, 1.0)
+    encoded = np.where(
+        clipped <= 0.0031308,
+        clipped * 12.92,
+        1.055 * clipped ** (1.0 / 2.4) - 0.055,
+    )
+    return np.clip(encoded * 255.0, 0, 255).astype(np.uint8)
+
+
 def _signed_lines(
     image: Image.Image,
     rng: random.Random,
@@ -184,46 +196,37 @@ def _ct_case(
     np_rng: np.random.Generator,
     severity: float,
     object_mask: Image.Image | None,
+    defect_mask: Image.Image | None,
 ) -> tuple[Image.Image, Affine, list[dict[str, Any]], Image.Image | None]:
     result, transform, records = image.copy(), Affine(), []
     mask = object_mask.copy() if object_mask is not None else None
     if case == "ct_cell_alignment_failure":
-        angle = rng.choice((-1, 1)) * rng.uniform(0.3, 1.5)
-        center = (result.width / 2.0, result.height / 2.0)
-        fill = background(result, "CT")
-        result = result.rotate(
-            angle,
-            resample=Image.Resampling.BICUBIC,
-            expand=False,
-            center=center,
-            fillcolor=fill,
-        )
-        if mask is not None:
-            mask = mask.rotate(
-                angle,
-                resample=Image.Resampling.NEAREST,
-                expand=False,
-                center=center,
-                fillcolor=0,
+        target_bbox = defect_mask.getbbox() if defect_mask is not None else None
+        if target_bbox is None:
+            array = np.asarray(result.convert("L"), dtype=np.float32)
+            threshold = float(np.quantile(array, 0.97))
+            estimated = Image.fromarray(
+                (array >= threshold).astype(np.uint8) * 255, mode="L"
             )
-        radians, cx, cy = math.radians(angle), center[0], center[1]
-        cosine, sine = math.cos(radians), math.sin(radians)
-        transform = transform.then(
-            Affine(
-                a=cosine,
-                b=sine,
-                d=-sine,
-                e=cosine,
-                xoff=cx - cosine * cx - sine * cy,
-                yoff=cy + sine * cx - cosine * cy,
-            )
-        )
-        magnitude_x = rng.uniform(0.08, 0.28)
-        magnitude_y = rng.uniform(0.08, 0.28)
-        if max(magnitude_x, magnitude_y) < 0.18:
-            magnitude_x = 0.18
-        dx = round(rng.choice((-1, 1)) * result.width * magnitude_x)
-        dy = round(rng.choice((-1, 1)) * result.height * magnitude_y)
+            target_bbox = estimated.getbbox()
+        if target_bbox is None:
+            raise ValueError("porosity_target_mask_is_empty")
+        left, top, right, bottom = target_bbox
+        candidates = {
+            "left": -(right + 1),
+            "right": result.width - left + 1,
+            "top": -(bottom + 1),
+            "bottom": result.height - top + 1,
+        }
+        minimum = min(abs(value) for value in candidates.values())
+        directions = [
+            direction
+            for direction, value in candidates.items()
+            if abs(value) <= minimum * 1.20
+        ]
+        direction = rng.choice(directions)
+        dx = candidates[direction] if direction in {"left", "right"} else 0
+        dy = candidates[direction] if direction in {"top", "bottom"} else 0
         fill = background(result, "CT")
         result = _translate(result, dx, dy, fill)
         if mask is not None:
@@ -232,49 +235,90 @@ def _ct_case(
         records.append(
             _record(
                 len(records) + 1,
-                "stack_consistent_rotate_translate",
+                "porosity_targeted_fov_crop",
                 severity,
-                angle_deg=angle,
+                direction=direction,
                 dx_px=dx,
                 dy_px=dy,
-                padding=fill,
+                background_value=fill,
+                target_bbox=list(target_bbox),
                 output_frame=[0, 0, result.width, result.height],
             )
         )
     elif case == "ct_acquisition_motion":
-        kernel, angle = rng.randrange(7, 26, 2), rng.uniform(0, 179)
-        result = _motion_blur(result, kernel, angle)
-        records.append(_record(1, "directional_motion_blur", severity, kernel=kernel, angle_deg=angle))
-        if rng.random() < 0.65:
-            offset, alpha = rng.randint(2, 12), rng.uniform(0.18, 0.48)
-            ghost = _translate(result, offset, 0, background(result, "CT"))
-            result = Image.blend(result, ghost, alpha)
-            records.append(_record(2, "double_edge_ghosting", severity, offset_px=offset, alpha=alpha))
+        angle = rng.uniform(0, 359)
+        normalized_offset = rng.uniform(18.0, 28.0)
+        scale = max(result.size) / 512.0
+        offset = max(1, round(normalized_offset * scale))
+        dx = round(math.cos(math.radians(angle)) * offset)
+        dy = round(math.sin(math.radians(angle)) * offset)
+        kernel = max(5, (round(rng.uniform(7, 15) * scale) | 1))
+        blurred = _motion_blur(result, kernel, angle)
+        shifted = _translate(result, dx, dy, background(result, "CT"))
+        shifted_weight = rng.uniform(0.45, 0.52)
+        result = Image.blend(blurred, shifted, shifted_weight)
+        records.append(
+            _record(
+                1,
+                "directional_motion_blur",
+                severity,
+                kernel=kernel,
+                angle_deg=angle,
+            )
+        )
+        records.append(
+            _record(
+                2,
+                "double_edge_ghosting",
+                severity,
+                offset_px=offset,
+                offset_final_512_px=normalized_offset,
+                dx_px=dx,
+                dy_px=dy,
+                shifted_weight=shifted_weight,
+                blurred_weight=1.0 - shifted_weight,
+            )
+        )
     elif case == "ct_low_signal_noise":
-        factor = rng.uniform(0.18, 0.55)
+        factor = rng.uniform(0.30, 0.55)
         result = ImageEnhance.Brightness(result).enhance(factor)
         records.append(_record(1, "signal_to_transmission", severity, signal_factor=factor))
         source = np.asarray(result.convert("L"), dtype=np.float32)
-        photons = rng.uniform(18.0, 70.0)
+        photons = rng.uniform(10.0, 40.0)
         sampled = np_rng.poisson(np.clip(source / 255.0, 0, 1) * photons) / photons * 255.0
         result = Image.fromarray(np.clip(sampled, 0, 255).astype(np.uint8)).convert(
             result.mode
         )
         records.append(_record(2, "poisson_sampling", severity, photon_scale=photons))
-        if rng.random() < 0.70:
-            sigma = rng.uniform(2, 9)
-            result = _noise(result, np_rng, sigma, monochrome=True)
-            records.append(_record(3, "read_noise", severity, sigma=sigma))
+        sigma = rng.uniform(1.275, 6.375)
+        result = _noise(result, np_rng, sigma, monochrome=True)
+        records.append(_record(3, "read_noise", severity, sigma=sigma))
     elif case == "ct_insufficient_projection_sampling":
         # Sparse-view Radon reconstruction: build a sinogram from rotated projections, apply a
         # ramp filter, then back-project only the retained angles. This creates reconstruction
         # streaks from missing acquisition views instead of drawing lines on the final slice.
         full_view_count = 40
-        drop_ratio = rng.uniform(0.20, 0.60)
-        view_count = max(8, round(full_view_count * (1.0 - drop_ratio)))
+        full_angles = np.linspace(0.0, 180.0, full_view_count, endpoint=False)
+        subtype = rng.choice(("sparse_view", "limited_angle"))
+        if subtype == "sparse_view":
+            retained_ratio = rng.uniform(0.20, 0.45)
+            view_count = max(8, round(full_view_count * retained_ratio))
+            indices = np.linspace(0, full_view_count - 1, view_count).round().astype(int)
+            angles = full_angles[indices]
+            removed_angle = None
+        else:
+            removed_width = rng.uniform(60.0, 120.0)
+            removed_start = rng.uniform(0.0, 180.0)
+            distance = (full_angles - removed_start) % 180.0
+            angles = full_angles[distance >= removed_width]
+            if len(angles) < 8:
+                angles = full_angles[distance >= 60.0]
+                removed_width = 60.0
+            view_count = len(angles)
+            retained_ratio = view_count / full_view_count
+            removed_angle = [removed_start, (removed_start + removed_width) % 180.0]
         accumulator = np.zeros((result.height, result.width), dtype=np.float32)
         gray = result.convert("L")
-        angles = np.linspace(0.0, 180.0, view_count, endpoint=False)
         for angle in angles:
             view = gray.rotate(float(angle), Image.Resampling.BILINEAR, expand=False)
             projection_1d = np.asarray(view, dtype=np.float32).sum(axis=0)
@@ -291,57 +335,138 @@ def _ct_case(
             )
             accumulator += np.asarray(back, dtype=np.float32)
         reconstructed = accumulator / view_count
+        low, high = np.percentile(reconstructed, (1.0, 99.0))
+        reconstructed = np.clip(
+            (reconstructed - low) * 255.0 / max(high - low, 1e-6),
+            0.0,
+            255.0,
+        )
         baseline = np.asarray(gray, dtype=np.float32)
+        reconstruction_weight = rng.uniform(0.75, 0.90)
         result = Image.fromarray(
-            np.clip(0.45 * baseline + 0.55 * reconstructed, 0, 255).astype(np.uint8)
+            np.clip(
+                (1.0 - reconstruction_weight) * baseline
+                + reconstruction_weight * reconstructed,
+                0,
+                255,
+            ).astype(np.uint8)
         ).convert(result.mode)
-        records.append(_record(1, "radon_projection_drop", severity, full_views=full_view_count, retained_views=view_count, dropped_ratio=drop_ratio))
-        records.append(_record(2, "filtered_back_projection", severity, view_angles_deg=angles.tolist()))
+        records.append(
+            _record(
+                1,
+                "radon_projection_drop",
+                severity,
+                subtype=subtype,
+                full_views=full_view_count,
+                retained_views=view_count,
+                retained_ratio=retained_ratio,
+                removed_angle_deg=removed_angle,
+                simulation_domain="reconstructed_slice_approximation",
+            )
+        )
+        records.append(
+            _record(
+                2,
+                "filtered_back_projection",
+                severity,
+                view_angles_deg=angles.tolist(),
+                percentile_normalization=[1, 99],
+                reconstruction_weight=reconstruction_weight,
+            )
+        )
     elif case == "ct_beam_hardening_metal_streak":
         array = np.asarray(result.convert("L"))
         threshold = float(np.quantile(array, rng.uniform(0.92, 0.98)))
-        mask = array >= threshold
-        if float(mask.mean()) < 0.001:
+        dense_region_mask = array >= threshold
+        if float(dense_region_mask.mean()) < 0.001:
             raise ValueError("dense_region_mask_too_small")
         attenuation = rng.uniform(0.20, 0.70)
         target = np.asarray(result).astype(np.float32)
-        target[mask] *= 1.0 - attenuation
+        target[dense_region_mask] *= 1.0 - attenuation
         result = _array_image(target, result.mode)
-        records.append(_record(1, "dense_material_mask", severity, threshold=threshold, area_ratio=float(mask.mean()), attenuation=attenuation))
+        records.append(_record(1, "dense_material_mask", severity, threshold=threshold, area_ratio=float(dense_region_mask.mean()), attenuation=attenuation))
         yy, xx = np.mgrid[0 : result.height, 0 : result.width]
-        dense_y, dense_x = np.where(mask)
+        dense_y, dense_x = np.where(dense_region_mask)
         center_x, center_y = float(dense_x.mean()), float(dense_y.mean())
-        radius = max(1.0, min(result.size) * rng.uniform(0.18, 0.42))
-        cupping = -rng.uniform(8, 30) * np.clip(
-            1.0 - np.hypot(xx - center_x, yy - center_y) / radius, 0.0, 1.0
+        object_bbox = object_mask.getbbox() if object_mask is not None else None
+        if object_bbox is None:
+            object_bbox = (0, 0, result.width, result.height)
+        object_width = max(1.0, object_bbox[2] - object_bbox[0])
+        object_height = max(1.0, object_bbox[3] - object_bbox[1])
+        radius_x = object_width * rng.uniform(0.35, 0.65)
+        radius_y = object_height * rng.uniform(0.35, 0.65)
+        elliptical = np.sqrt(
+            ((xx - center_x) / radius_x) ** 2
+            + ((yy - center_y) / radius_y) ** 2
         )
+        asymmetry = 1.0 + rng.uniform(-0.35, 0.35) * np.clip(
+            (xx - center_x) / radius_x, -1.0, 1.0
+        )
+        cupping = -rng.uniform(8, 30) * np.clip(1.0 - elliptical, 0.0, 1.0) * asymmetry
         result = _luminance_field(result, cupping.astype(np.float32))
-        records.append(_record(2, "cupping_field", severity, center=[center_x, center_y], radius=radius))
-        count = rng.randint(2, 12)
+        records.append(_record(2, "cupping_field", severity, center=[center_x, center_y], radii=[radius_x, radius_y], asymmetric=True))
+        count = rng.randint(24, 72)
         field = Image.new("F", result.size, 0.0)
         draw = ImageDraw.Draw(field)
         diagonal = math.hypot(result.width, result.height)
-        centers: list[list[int]] = []
-        for _ in range(count):
-            selected = rng.randrange(len(dense_x))
-            cx, cy = int(dense_x[selected]), int(dense_y[selected])
-            angle = math.radians(rng.uniform(0, 179))
+        selected = rng.randrange(len(dense_x))
+        cx, cy = int(dense_x[selected]), int(dense_y[selected])
+        start_angle = rng.uniform(0, 360)
+        jitter_limit = min(3.0, 120.0 / count)
+        angles: list[float] = []
+        for index in range(count):
+            angle_deg = (
+                start_angle
+                + index * (360.0 / count)
+                + rng.uniform(-jitter_limit, jitter_limit)
+            ) % 360.0
+            angle = math.radians(angle_deg)
+            delta = rng.choice((-1, 1)) * rng.uniform(12, 48)
             draw.line(
                 (
-                    cx - math.cos(angle) * diagonal,
-                    cy - math.sin(angle) * diagonal,
+                    cx,
+                    cy,
                     cx + math.cos(angle) * diagonal,
                     cy + math.sin(angle) * diagonal,
                 ),
-                fill=float(-rng.randint(15, 60)),
-                width=rng.randint(1, 5),
+                fill=float(delta),
+                width=rng.randint(1, 3),
             )
-            centers.append([cx, cy])
-        streak_field = np.asarray(field)
+            angles.append(angle_deg)
+        streak_field = np.asarray(field).copy()
+        distance = np.hypot(xx - cx, yy - cy)
+        decay_scale = max(result.size) * rng.uniform(0.45, 0.80)
+        streak_field *= np.exp(-distance / max(decay_scale, 1.0))
+        if object_mask is not None:
+            object_array = np.asarray(object_mask.convert("L")) > 0
+            air_factor = np.where(object_array, 1.0, 0.08)
+            streak_field *= air_factor
         streak_mask = streak_field != 0
-        dense_intersections = int((streak_mask & mask).sum())
+        dense_intersections = int((streak_mask & dense_region_mask).sum())
         result = _luminance_field(result, streak_field)
-        records.append(_record(3, "metal_anchored_streaks", severity, streak_count=count, dense_region_centers=centers, dense_intersection_pixels=dense_intersections))
+        ordered = sorted(angles)
+        gaps = [
+            (ordered[(index + 1) % len(ordered)] - ordered[index]) % 360.0
+            for index in range(len(ordered))
+        ]
+        records.append(
+            _record(
+                3,
+                "metal_anchored_streaks",
+                severity,
+                streak_count=count,
+                dense_region_center=[cx, cy],
+                ray_angles_deg=angles,
+                max_angular_gap_deg=max(gaps),
+                quadrant_counts=[
+                    sum(1 for value in angles if start <= value < start + 90)
+                    for start in (0, 90, 180, 270)
+                ],
+                distance_decay_scale_px=decay_scale,
+                air_alpha_cap=0.08,
+                dense_intersection_pixels=dense_intersections,
+            )
+        )
     else:
         raise ValueError(f"Unknown CT failure case: {case}")
     return result, transform, records, mask
@@ -391,45 +516,44 @@ def _rgb_case(
             crop[1] += amount
         else:
             crop[3] -= amount
+        # Keep the source aspect ratio.  The timing error still cuts through the
+        # battery on the selected edge, while the perpendicular axis is cropped
+        # symmetrically so the common resize stage does not distort the frame.
+        aspect = result.width / result.height
+        current_width = crop[2] - crop[0]
+        current_height = crop[3] - crop[1]
+        if side in {"left", "right"}:
+            target_height = min(current_height, max(1, round(current_width / aspect)))
+            trim = current_height - target_height
+            crop[1] += trim // 2
+            crop[3] -= trim - trim // 2
+        else:
+            target_width = min(current_width, max(1, round(current_height * aspect)))
+            trim = current_width - target_width
+            crop[0] += trim // 2
+            crop[2] -= trim - trim // 2
         result = result.crop(tuple(crop))
         if mask is not None:
             mask = mask.crop(tuple(crop))
         transform = transform.then(Affine(xoff=-crop[0], yoff=-crop[1]))
-        records.append(_record(1, "timing_edge_crop", severity, side=side, crop_box=crop))
+        records.append(
+            _record(
+                1,
+                "timing_edge_crop",
+                severity,
+                side=side,
+                crop_box=crop,
+                source_aspect_ratio=aspect,
+                output_aspect_ratio=result.width / result.height,
+            )
+        )
         if rng.random() < 0.35:
             kernel = rng.randrange(5, 18, 2)
             result = _motion_blur(result, kernel, 0 if side in {"left", "right"} else 90)
             records.append(_record(2, "conveyor_motion_blur", severity, kernel=kernel))
-    elif case == "rgb_alignment_failure":
-        angle = rng.choice((-1, 1)) * rng.uniform(6, 28)
-        center = (result.width / 2, result.height / 2)
-        fill = background(result, "RGB")
-        result = result.rotate(angle, resample=Image.Resampling.BICUBIC, expand=False, center=center, fillcolor=fill)
-        if mask is not None:
-            mask = mask.rotate(
-                angle,
-                resample=Image.Resampling.NEAREST,
-                expand=False,
-                center=center,
-                fillcolor=0,
-            )
-        radians, cx, cy = math.radians(angle), center[0], center[1]
-        cosine, sine = math.cos(radians), math.sin(radians)
-        rotation = Affine(
-            a=cosine, b=sine, d=-sine, e=cosine,
-            xoff=cx - cosine * cx - sine * cy,
-            yoff=cy + sine * cx - cosine * cy,
-        )
-        transform = transform.then(rotation)
-        dx = round(rng.choice((-1, 1)) * result.width * rng.uniform(0.08, 0.30))
-        dy = round(rng.choice((-1, 1)) * result.height * rng.uniform(0.08, 0.30))
-        result = _translate(result, dx, dy, fill)
-        if mask is not None:
-            mask = _translate(mask, dx, dy, 0)
-        transform = transform.then(Affine(xoff=dx, yoff=dy))
-        records.append(_record(1, "object_rotate_translate", severity, angle_deg=angle, center=list(center), dx_px=dx, dy_px=dy, padding=fill))
     elif case == "rgb_uneven_lighting":
-        angle = math.radians(rng.uniform(0, 359))
+        angle_deg = rng.choice((0.0, 90.0, 180.0, 270.0))
+        angle = math.radians(angle_deg)
         yy, xx = np.mgrid[0 : result.height, 0 : result.width]
         projection = xx * math.cos(angle) + yy * math.sin(angle)
         if mask is not None and mask.getbbox() is not None:
@@ -447,11 +571,12 @@ def _rgb_case(
         # visual QA read as evenly lit (11 of 30 samples rejected; every rejected sample had a
         # dark gain of 0.481 or more). Draw the dark end from the range that actually reads as
         # uneven lighting instead of relying on the gate to reject the weak draws.
-        dark, bright = rng.uniform(0.25, 0.45), rng.uniform(1.15, 1.70)
-        gain = dark + (bright - dark) * projection
+        dark, bright = rng.uniform(0.35, 0.65), rng.uniform(1.20, 1.55)
+        smooth_projection = projection * projection * (3.0 - 2.0 * projection)
+        gain = dark + (bright - dark) * smooth_projection
         array = np.asarray(result).astype(np.float32) * gain[..., None]
         result = _array_image(array, "RGB")
-        records.append(_record(1, "lighting_gradient", severity, angle_deg=math.degrees(angle), dark_gain=dark, bright_gain=bright))
+        records.append(_record(1, "lighting_gradient", severity, angle_deg=angle_deg, dark_gain=dark, bright_gain=bright, transition="smoothstep"))
     elif case == "rgb_reflection_glare":
         count = rng.randint(1, 2)
         overlay = Image.new("RGBA", result.size, (0, 0, 0, 0))
@@ -558,12 +683,48 @@ def _rgb_case(
             result = _motion_blur(result, kernel, angle)
             records.append(_record(2, "mild_motion_blur", severity, kernel=kernel, angle_deg=angle))
     elif case == "rgb_underexposure":
-        factor, gamma = rng.uniform(0.12, 0.48), rng.uniform(1.25, 2.20)
-        result = _gamma(ImageEnhance.Brightness(result).enhance(factor), gamma)
-        records.append(_record(1, "underexposure", severity, brightness_factor=factor, gamma=gamma))
-        sigma = rng.uniform(6, 24)
-        result = _noise(result, np_rng, sigma, monochrome=False)
-        records.append(_record(2, "sensor_noise", severity, sigma=sigma))
+        linear = _srgb_to_linear(np.asarray(result.convert("RGB")))
+        factor = rng.uniform(0.30, 0.55)
+        exposed = linear * factor
+        photon_capacity = rng.uniform(80.0, 220.0)
+        sampled = (
+            np_rng.poisson(np.clip(exposed, 0.0, 1.0) * photon_capacity)
+            / photon_capacity
+        )
+        read_sigma = rng.uniform(0.005, 0.015)
+        shared = np_rng.normal(0.0, read_sigma, sampled.shape[:2])[..., None]
+        chroma = np_rng.normal(
+            0.0, read_sigma * 0.25, sampled.shape
+        )
+        black_level = rng.uniform(0.003, 0.012)
+        sampled = np.clip(sampled + shared + chroma - black_level, 0.0, 1.0)
+        result = Image.fromarray(_linear_to_srgb(sampled), mode="RGB")
+        records.append(
+            _record(
+                1,
+                "linear_exposure_reduction",
+                severity,
+                exposure_factor=factor,
+            )
+        )
+        records.append(
+            _record(
+                2,
+                "signal_dependent_shot_noise",
+                severity,
+                photon_capacity=photon_capacity,
+            )
+        )
+        records.append(
+            _record(
+                3,
+                "sensor_read_noise",
+                severity,
+                sigma=read_sigma,
+                chroma_sigma=read_sigma * 0.25,
+                black_level=black_level,
+            )
+        )
     elif case == "rgb_overexposure":
         factor, gamma = rng.uniform(1.45, 2.60), rng.uniform(0.45, 0.85)
         result = _gamma(ImageEnhance.Brightness(result).enhance(factor), gamma)
@@ -573,33 +734,63 @@ def _rgb_case(
         result = _array_image(array, "RGB")
         records.append(_record(1, "overexposure", severity, brightness_factor=factor, gamma=gamma, clip_threshold=threshold))
     elif case == "rgb_surface_dust":
-        count = rng.randint(3, 14)
-        overlay = Image.new("RGBA", result.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
+        count = rng.randint(1, 4)
+        core = Image.new("RGBA", result.size, (0, 0, 0, 0))
+        halo = Image.new("RGBA", result.size, (0, 0, 0, 0))
+        core_draw = ImageDraw.Draw(core)
+        halo_draw = ImageDraw.Draw(halo)
         particles = []
         # Lens contamination belongs to camera-frame coordinates and must not follow the
         # battery outline when the object moves.
         eligible: list[tuple[int, int]] = []
-        object_area = result.width * result.height
-        target_ratio = rng.uniform(0.01, 0.08)
-        nominal_radius = max(
-            0.5,
-            min(6.0, math.sqrt(target_ratio * object_area / (math.pi * count))),
-        )
+        long_side = max(result.size)
         for _ in range(count):
-            radius = nominal_radius * rng.uniform(0.75, 1.25)
+            radius = long_side * rng.uniform(0.01, 0.06)
             cx, cy = (
                 rng.choice(eligible)
                 if eligible
                 else (rng.uniform(0, result.width), rng.uniform(0, result.height))
             )
             color = rng.choice(((65, 62, 58), (105, 101, 94), (145, 140, 130)))
-            alpha = rng.randint(25, 80)
-            draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=(*color, alpha))
-            particles.append([round(cx, 2), round(cy, 2), round(radius, 2), alpha])
-        blur_radius = rng.uniform(2.0, 6.0)
-        result = Image.alpha_composite(result.convert("RGBA"), overlay.filter(ImageFilter.GaussianBlur(blur_radius))).convert("RGB")
-        dust_mask = np.asarray(overlay.getchannel("A")) > 0
+            core_alpha = round(255 * rng.uniform(0.05, 0.20))
+            halo_alpha = round(255 * rng.uniform(0.03, 0.10))
+            halo_scale = rng.uniform(1.5, 3.5)
+            halo_radius = radius * halo_scale
+            halo_draw.ellipse(
+                (
+                    cx - halo_radius,
+                    cy - halo_radius,
+                    cx + halo_radius,
+                    cy + halo_radius,
+                ),
+                fill=(*color, halo_alpha),
+            )
+            core_draw.ellipse(
+                (cx - radius, cy - radius, cx + radius, cy + radius),
+                fill=(*color, core_alpha),
+            )
+            particles.append(
+                [
+                    round(cx, 2),
+                    round(cy, 2),
+                    round(radius, 2),
+                    core_alpha,
+                    round(halo_scale, 3),
+                    halo_alpha,
+                ]
+            )
+        blur_radius = long_side * rng.uniform(0.008, 0.025)
+        composite = Image.alpha_composite(
+            result.convert("RGBA"),
+            halo.filter(ImageFilter.GaussianBlur(blur_radius * 1.5)),
+        )
+        result = Image.alpha_composite(
+            composite, core.filter(ImageFilter.GaussianBlur(blur_radius))
+        ).convert("RGB")
+        combined_alpha = np.maximum(
+            np.asarray(core.getchannel("A")), np.asarray(halo.getchannel("A"))
+        )
+        dust_mask = combined_alpha > 0
         object_array = (
             np.asarray(mask.convert("L")) > 0
             if mask is not None
@@ -615,10 +806,8 @@ def _rgb_case(
             (dust_mask & defect_array).sum() / max(defect_array.sum(), 1)
         )
         records.append(_record(1, "lens_dust_shadow", severity, shadow_count=count, shadows=particles, frame_affected_ratio=float(dust_mask.mean()), blur_radius_final_space=blur_radius, coordinate_space="camera_frame"))
-        if count >= 8:
-            records.append(_record(2, "lens_dust_cluster", severity, cluster_count=1))
     elif case == "rgb_hair_contamination":
-        count = rng.randint(1, 3)
+        count = rng.randint(1, 2)
         overlay = Image.new("RGBA", result.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
         curves = []
@@ -653,8 +842,8 @@ def _rgb_case(
                     axis_major[0] * sin_j + axis_major[1] * cos_j,
                 ]
             )
-            desired = rng.uniform(0.35, 0.90) * long_side
-            length = min(desired, 0.88 * long_side, max(0.35 * long_side, 1.5 * inside_len))
+            desired = rng.uniform(0.15, 0.60) * long_side
+            length = min(desired, 0.60 * long_side)
             centre = centroid + axis_major * (rng.uniform(-0.10, 0.10) * inside_len)
             start = centre - direction * (length / 2.0)
             end = centre + direction * (length / 2.0)
@@ -672,7 +861,8 @@ def _rgb_case(
                 ),
                 (float(end[0]), float(end[1])),
             ]
-            width, alpha = rng.randint(1, 3), rng.randint(55, 125)
+            width = max(1, round(long_side * rng.uniform(0.0015, 0.006)))
+            alpha = round(255 * rng.uniform(0.05, 0.18))
             samples = []
             for index in range(41):
                 t = index / 40
@@ -735,7 +925,7 @@ def apply_failure_case(
     severity = rng.uniform(0.62, 1.0)
     if modality == "CT":
         result, transform, records, transformed_mask = _ct_case(
-            image, failure_case, rng, np_rng, severity, object_mask
+            image, failure_case, rng, np_rng, severity, object_mask, defect_mask
         )
     else:
         result, transform, records, transformed_mask = _rgb_case(
@@ -792,7 +982,7 @@ def validate_augmented(
     baseline_mean = max(float(baseline.mean()), 1.0)
     output_mean = float(luminance.mean())
 
-    if {"signal_to_transmission", "underexposure"} & record_types:
+    if {"signal_to_transmission", "linear_exposure_reduction"} & record_types:
         if output_mean > baseline_mean * 0.72:
             raise ValueError("quality_gate: underexposure is not strong enough")
     if "overexposure" in record_types:
@@ -843,10 +1033,10 @@ def validate_augmented(
             record["parameters"] for record in records if record["type"] == "lens_dust_shadow"
         )
         count = int(parameters.get("shadow_count", 0))
-        if not 3 <= count <= 14:
-            raise ValueError("quality_gate: lens dust shadow count is outside 3..14")
+        if not 1 <= count <= 4:
+            raise ValueError("quality_gate: lens dust shadow count is outside 1..4")
         coverage = float(parameters.get("frame_affected_ratio", 0))
-        if not 0.001 <= coverage <= 0.20:
+        if not 0.001 <= coverage <= 0.35:
             raise ValueError("quality_gate: lens dust frame coverage is outside range")
     if "surface_aware_specular_reflection" in record_types:
         parameters = records[0]["parameters"]
@@ -868,22 +1058,35 @@ def validate_augmented(
             raise ValueError(
                 "quality_gate: photon-starvation streak does not cross dense region"
             )
+        quadrants = streak_record["parameters"].get("quadrant_counts", [])
+        if len(quadrants) != 4 or any(int(count) < 4 for count in quadrants):
+            raise ValueError(
+                "quality_gate: metal streak rays do not cover all four quadrants"
+            )
+        if float(streak_record["parameters"].get("max_angular_gap_deg", 360)) > 35:
+            raise ValueError(
+                "quality_gate: metal streak maximum angular gap exceeds 35 degrees"
+            )
     if "lens_fiber_shadow" in record_types:
         curves = records[0]["parameters"].get("curves", [])
-        if not 1 <= len(curves) <= 3:
-            raise ValueError("quality_gate: hair curve count is outside 1..3")
-        if any(not 1 <= int(curve["thickness_px"]) <= 3 for curve in curves):
-            raise ValueError("quality_gate: hair thickness is outside 1..3 px")
-        long_side = max(image.size)
+        if not 1 <= len(curves) <= 2:
+            raise ValueError("quality_gate: hair curve count is outside 1..2")
+        maximum_width = max(1, math.ceil(max(image.size) * 0.006))
         if any(
-            not 0.35 * long_side <= float(curve["length_px"]) <= 0.90 * long_side
+            not 1 <= int(curve["thickness_px"]) <= maximum_width
             for curve in curves
         ):
-            raise ValueError("quality_gate: hair length is outside 35%..90% of long side")
+            raise ValueError("quality_gate: hair thickness is outside v1.7 range")
+        long_side = max(image.size)
+        if any(
+            not 0.15 * long_side <= float(curve["length_px"]) <= 0.60 * long_side
+            for curve in curves
+        ):
+            raise ValueError("quality_gate: hair length is outside 15%..60% of long side")
     if (
         original_object_mask is not None
         and output_object_mask is not None
-        and {"stack_consistent_rotate_translate", "timing_edge_crop", "object_rotate_translate"}
+        and {"porosity_targeted_fov_crop", "timing_edge_crop"}
         & record_types
     ):
         original_area = max(
@@ -892,8 +1095,8 @@ def validate_augmented(
         output_area = int((np.asarray(output_object_mask.convert("L")) > 0).sum())
         retained = output_area / original_area
         minimum = (
-            0.60
-            if "stack_consistent_rotate_translate" in record_types
+            0.10
+            if "porosity_targeted_fov_crop" in record_types
             else 0.50
             if "timing_edge_crop" in record_types
             else 0.60
@@ -910,7 +1113,7 @@ def validate_augmented(
                 f"quality_gate: outline retention {retained:.3f} is above 0.90; "
                 "the crop did not clip the battery"
             )
-        if "stack_consistent_rotate_translate" in record_types and retained > 0.95:
+        if "porosity_targeted_fov_crop" in record_types and retained > 0.95:
             raise ValueError(
                 f"quality_gate: outline retention {retained:.3f} is above 0.95; "
                 "alignment failure did not remove enough required structure"

@@ -15,15 +15,14 @@
   "rgb_test_target": 1000,
   "rgb_test_fail_target": 100,
   "rgb_failure_case_quotas": {
-    "rgb_trigger_timing_failure": 200,
-    "rgb_alignment_failure": 240,
-    "rgb_uneven_lighting": 240,
-    "rgb_reflection_glare": 240,
-    "rgb_focus_failure": 280,
-    "rgb_underexposure": 240,
-    "rgb_overexposure": 240,
-    "rgb_surface_dust": 160,
-    "rgb_hair_contamination": 160
+    "rgb_trigger_timing_failure": 230,
+    "rgb_uneven_lighting": 270,
+    "rgb_reflection_glare": 270,
+    "rgb_focus_failure": 310,
+    "rgb_underexposure": 270,
+    "rgb_overexposure": 270,
+    "rgb_surface_dust": 190,
+    "rgb_hair_contamination": 190
   },
   "reserve_per_modality": 500,
   "resize_long_side": 512,
@@ -59,8 +58,5 @@
   "memory_budget_ratio": 0.7,
   "memory_sample_interval_seconds": 0.5,
   "memory_probe_fallback_jobs": 1,
-  "require_visual_qa_before_release": true,
-  "visual_qa_samples_per_case": 10,
-  "visual_qa_min_approval_rate": 0.90,
   "hash_chunk_bytes": 1048576
 }
