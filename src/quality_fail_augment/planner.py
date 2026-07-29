@@ -897,20 +897,7 @@ def create_plan(
         for index in range(target):
             failure_case = case_by_index.get(index, "")
             eligible_index = 0
-            if failure_case == "ct_cell_alignment_failure":
-                eligible_index = next(
-                    (
-                        position
-                        for position, candidate in enumerate(available)
-                        if candidate.porosity_component_count > 0
-                    ),
-                    -1,
-                )
-                if eligible_index < 0:
-                    raise ValueError(
-                        "CT alignment quota cannot be filled from porosity sources"
-                    )
-            elif failure_case == "ct_beam_hardening_metal_streak":
+            if failure_case == "ct_beam_hardening_metal_streak":
                 eligible_index = next(
                     (
                         position

@@ -268,55 +268,116 @@ def _ct_case(
     result, transform, records = image.copy(), Affine(), []
     mask = object_mask.copy() if object_mask is not None else None
     if case == "ct_cell_alignment_failure":
-        target_bbox = defect_mask.getbbox() if defect_mask is not None else None
-        if target_bbox is None:
-            array = np.asarray(result.convert("L"), dtype=np.float32)
-            threshold = float(np.quantile(array, 0.97))
-            estimated = Image.fromarray(
-                (array >= threshold).astype(np.uint8) * 255, mode="L"
-            )
-            target_bbox = estimated.getbbox()
-        if target_bbox is None:
-            raise ValueError("porosity_target_mask_is_empty")
-        left, top, right, bottom = target_bbox
-        candidates = {
-            "left": -(right + 1),
-            "right": result.width - left + 1,
-            "top": -(bottom + 1),
-            "bottom": result.height - top + 1,
-        }
-        direction = (
-            (group_rng or rng).choice(("left", "right", "top", "bottom"))
-            if group_rng is not None
-            else min(candidates, key=lambda name: (abs(candidates[name]), name))
+        source_size = result.size
+        aspect = result.width / result.height
+        directions = ("left", "right", "top", "bottom")
+        direction_rng = group_rng or rng
+        direction_start = direction_rng.randrange(0, len(directions))
+        ordered_directions = (
+            directions[direction_start:] + directions[:direction_start]
         )
-        dx = candidates[direction] if direction in {"left", "right"} else 0
-        dy = candidates[direction] if direction in {"top", "bottom"} else 0
-        fill = background(result, "CT")
-        result = _translate(result, dx, dy, fill)
+
+        def crop_for(side: str, amount: int) -> list[int]:
+            candidate = [0, 0, result.width, result.height]
+            if side == "left":
+                candidate[0] += amount
+            elif side == "right":
+                candidate[2] -= amount
+            elif side == "top":
+                candidate[1] += amount
+            else:
+                candidate[3] -= amount
+            current_width = candidate[2] - candidate[0]
+            current_height = candidate[3] - candidate[1]
+            if side in {"left", "right"}:
+                target_height = min(
+                    current_height, max(1, round(current_width / aspect))
+                )
+                trim = current_height - target_height
+                candidate[1] += trim // 2
+                candidate[3] -= trim - trim // 2
+            else:
+                target_width = min(
+                    current_width, max(1, round(current_height * aspect))
+                )
+                trim = current_width - target_width
+                candidate[0] += trim // 2
+                candidate[2] -= trim - trim // 2
+            return candidate
+
+        target_retained_ratio = rng.uniform(0.60, 0.82)
+        selected: tuple[str, list[int], float | None] | None = None
+        if mask is None or mask.getbbox() is None:
+            raise ValueError("alignment_crop_requires_object_mask")
+        else:
+            original_area = max(int((np.asarray(mask) > 0).sum()), 1)
+            for direction in ordered_directions:
+                axis_size = (
+                    result.width
+                    if direction in {"left", "right"}
+                    else result.height
+                )
+                low_amount, high_amount = 1, axis_size - 1
+                best_crop = crop_for(direction, low_amount)
+                best_retained = (
+                    int((np.asarray(mask.crop(tuple(best_crop))) > 0).sum())
+                    / original_area
+                )
+                best_distance = abs(best_retained - target_retained_ratio)
+                for _ in range(20):
+                    amount = (low_amount + high_amount) // 2
+                    candidate = crop_for(direction, amount)
+                    retained = (
+                        int((np.asarray(mask.crop(tuple(candidate))) > 0).sum())
+                        / original_area
+                    )
+                    distance = abs(retained - target_retained_ratio)
+                    if distance < best_distance:
+                        best_crop = candidate
+                        best_retained = retained
+                        best_distance = distance
+                    if retained > target_retained_ratio:
+                        low_amount = min(amount + 1, high_amount)
+                    else:
+                        high_amount = max(amount - 1, low_amount)
+                if 0.50 <= best_retained <= 0.90:
+                    selected = (direction, best_crop, best_retained)
+                    break
+            if selected is None:
+                raise ValueError("alignment_crop_no_gate_safe_window")
+
+        direction, crop, retained_outline_ratio = selected
+        cropped_width = crop[2] - crop[0]
+        cropped_height = crop[3] - crop[1]
+        result = result.crop(tuple(crop)).resize(
+            source_size, Image.Resampling.LANCZOS
+        )
         if mask is not None:
-            mask = _translate(mask, dx, dy, 0)
-        transform = transform.then(Affine(xoff=dx, yoff=dy))
+            mask = mask.crop(tuple(crop)).resize(
+                source_size, Image.Resampling.NEAREST
+            )
+        transform = transform.then(
+            Affine(xoff=-crop[0], yoff=-crop[1])
+        ).then(
+            Affine(
+                a=source_size[0] / cropped_width,
+                e=source_size[1] / cropped_height,
+            )
+        )
         records.append(
             _record(
                 len(records) + 1,
-                "porosity_targeted_fov_crop",
+                "alignment_edge_crop",
                 severity,
                 direction=direction,
-                dx_px=dx,
-                dy_px=dy,
-                offset_source_space=[dx, dy],
-                background_value=fill,
-                target_bbox=list(target_bbox),
-                target_defect_ids=list((case_options or {}).get("target_defect_ids", [])),
-                removed_defect_ids=list((case_options or {}).get("target_defect_ids", [])),
-                retained_outline_ratio=(
-                    float((np.asarray(mask) > 0).sum())
-                    / max(float((np.asarray(object_mask) > 0).sum()), 1.0)
-                    if mask is not None and object_mask is not None
-                    else None
-                ),
-                output_frame=[0, 0, result.width, result.height],
+                crop_box=crop,
+                source_size=list(source_size),
+                output_size=list(result.size),
+                source_aspect_ratio=aspect,
+                output_aspect_ratio=result.width / result.height,
+                resize_to_source_size=True,
+                target_outline_retained_ratio=target_retained_ratio,
+                retained_outline_ratio=retained_outline_ratio,
             )
         )
     elif case == "ct_acquisition_motion":
@@ -1363,24 +1424,27 @@ def validate_augmented(
             for curve in curves
         ):
             raise ValueError("quality_gate: hair length is outside 15%..60% of long side")
+    if "alignment_edge_crop" in record_types:
+        alignment_record = next(
+            record for record in records if record["type"] == "alignment_edge_crop"
+        )
+        retained = alignment_record["parameters"].get("retained_outline_ratio")
+        if retained is not None and not 0.50 <= float(retained) <= 0.90:
+            raise ValueError(
+                f"quality_gate: alignment outline retention {float(retained):.3f} "
+                "is outside 0.50..0.90"
+            )
     if (
         original_object_mask is not None
         and output_object_mask is not None
-        and {"porosity_targeted_fov_crop", "timing_edge_crop"}
-        & record_types
+        and "timing_edge_crop" in record_types
     ):
         original_area = max(
             int((np.asarray(original_object_mask.convert("L")) > 0).sum()), 1
         )
         output_area = int((np.asarray(output_object_mask.convert("L")) > 0).sum())
         retained = output_area / original_area
-        minimum = (
-            0.10
-            if "porosity_targeted_fov_crop" in record_types
-            else 0.50
-            if "timing_edge_crop" in record_types
-            else 0.60
-        )
+        minimum = 0.50
         if retained < minimum:
             raise ValueError(
                 f"quality_gate: outline retention {retained:.3f} is below {minimum:.2f}"
@@ -1392,9 +1456,4 @@ def validate_augmented(
             raise ValueError(
                 f"quality_gate: outline retention {retained:.3f} is above 0.90; "
                 "the crop did not clip the battery"
-            )
-        if "porosity_targeted_fov_crop" in record_types and retained > 0.95:
-            raise ValueError(
-                f"quality_gate: outline retention {retained:.3f} is above 0.95; "
-                "alignment failure did not remove enough required structure"
             )

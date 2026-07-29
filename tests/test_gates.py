@@ -103,13 +103,19 @@ class FailureCaseTests(unittest.TestCase):
         draw = ImageDraw.Draw(image)
         draw.rectangle((12, 12, 84, 84), outline=(230, 230, 230), width=4)
         draw.rectangle((40, 40, 55, 55), fill=(250, 250, 250))
+        object_mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(object_mask).rectangle((12, 12, 84, 84), fill=255)
         for index, case in enumerate(CT_CASES + RGB_CASES):
             modality = "CT" if case.startswith("ct_") else "RGB"
             last_error = None
             for retry in range(16):
                 try:
                     result = apply_failure_case(
-                        image, modality, case, 1000 + index * 100 + retry
+                        image,
+                        modality,
+                        case,
+                        1000 + index * 100 + retry,
+                        object_mask=object_mask,
                     )
                     break
                 except ValueError as exc:
@@ -160,6 +166,48 @@ class FailureCaseTests(unittest.TestCase):
             image.width / image.height,
             delta=0.02,
         )
+
+    def test_ct_alignment_uses_gate_safe_same_size_crop_without_porosity(self) -> None:
+        image = Image.new("L", (160, 90), 20)
+        ImageDraw.Draw(image).rectangle((35, 8, 125, 82), fill=170)
+        object_mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(object_mask).rectangle((35, 8, 125, 82), fill=255)
+
+        directions = set()
+        for seed in range(8):
+            result = apply_failure_case(
+                image,
+                "CT",
+                "ct_cell_alignment_failure",
+                20260729 + seed,
+                object_mask=object_mask,
+                defect_mask=None,
+                group_seed=777 + seed,
+            )
+            self.assertEqual(result.image.size, image.size)
+            self.assertAlmostEqual(
+                result.image.width / result.image.height,
+                image.width / image.height,
+                delta=0.001,
+            )
+            self.assertEqual(result.records[0]["type"], "alignment_edge_crop")
+            directions.add(result.records[0]["parameters"]["direction"])
+            retained = result.records[0]["parameters"]["retained_outline_ratio"]
+            self.assertGreaterEqual(retained, 0.50)
+            self.assertLessEqual(retained, 0.90)
+        self.assertGreater(len(directions), 1)
+
+        with self.assertRaisesRegex(
+            ValueError, "alignment_crop_requires_object_mask"
+        ):
+            apply_failure_case(
+                image,
+                "CT",
+                "ct_cell_alignment_failure",
+                20260729,
+                object_mask=None,
+                defect_mask=None,
+            )
 
 
 if __name__ == "__main__":

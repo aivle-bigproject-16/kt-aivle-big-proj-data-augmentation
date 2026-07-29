@@ -183,16 +183,6 @@ def apply_quality_transform(
         raise ValueError(f"Unknown quality label: {quality}")
     if not failure_case:
         raise ValueError("FAIL slot has no failure_case")
-    if (
-        modality == "CT"
-        and failure_case == "ct_cell_alignment_failure"
-        and (
-            source.porosity_mask is None
-            or source.porosity_mask.getbbox() is None
-        )
-    ):
-        raise ValueError("ct_cell_alignment_failure requires a porosity polygon")
-
     last_error: Exception | None = None
     for attempt in range(max_retries):
         try:
@@ -202,12 +192,7 @@ def apply_quality_transform(
                 failure_case,
                 stable_seed(case_seed if case_seed is not None else item_seed, "retry", attempt),
                 object_mask=source.object_mask,
-                defect_mask=(
-                    source.porosity_mask
-                    if modality == "CT"
-                    and failure_case == "ct_cell_alignment_failure"
-                    else source.defect_mask
-                ),
+                defect_mask=source.defect_mask,
                 group_seed=group_seed,
                 case_options={
                     **(config or {}),
