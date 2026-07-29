@@ -44,7 +44,7 @@ def parser() -> argparse.ArgumentParser:
     plan.add_argument("--config", type=Path, required=True)
     plan.add_argument("--output", type=Path, required=True)
     plan.add_argument("--reuse-scan", type=Path, help=_REUSE_SCAN_HELP)
-    make = commands.add_parser("generate", help="Generate from an approved plan")
+    make = commands.add_parser("generate", help="Generate from a frozen deterministic plan")
     make.add_argument("--raw-root", type=Path, required=True)
     make.add_argument("--config", type=Path, required=True)
     make.add_argument("--plan", type=Path, required=True)
@@ -63,7 +63,7 @@ def parser() -> argparse.ArgumentParser:
         default=set(),
         metavar="CASE[,CASE...]",
         help="With --resume, forget the committed samples of these failure cases so they "
-        "are regenerated. Use after visual QA rejects a case and its parameters change",
+        "are regenerated after their augmentation parameters change",
     )
     check = commands.add_parser("verify", help="Verify an existing generated dataset")
     check.add_argument("--output", type=Path, required=True)

@@ -447,11 +447,10 @@ def _drop_failure_cases(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Forget the committed samples of the given failure cases so --resume rebuilds them.
 
-    Visual QA rejects a whole failure case, not individual samples, and the QA sample set is
-    keyed on synthetic_id. Dropping only the rejected case keeps every other case's approvals
-    reusable, because the regenerated samples reappear under the same synthetic_ids. The files
-    are not deleted here: once the rows are gone, _cleanup_uncommitted treats the leftovers as
-    manifest-less output and removes them through the existing recovery path.
+    This is used after a case's augmentation parameters change. Regenerated samples reappear
+    under the same synthetic_ids. The files are not deleted here: once the rows are gone,
+    _cleanup_uncommitted treats the leftovers as manifest-less output and removes them through
+    the existing recovery path.
     """
     dropped = {
         row["synthetic_id"]

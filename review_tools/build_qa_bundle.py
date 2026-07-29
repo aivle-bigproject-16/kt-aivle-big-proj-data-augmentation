@@ -419,7 +419,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True, help="generate 가 만든 출력 폴더")
     parser.add_argument("--config", type=Path, required=True, help="생성에 쓴 config JSON")
     parser.add_argument("--bundle", type=Path, help="번들을 만들 위치 (기본: <output>-qa_bundle)")
-    parser.add_argument("--version", default="v1.6", help="번들 표시용 버전 문자열")
+    parser.add_argument("--version", default="v1.7", help="번들 표시용 버전 문자열")
     args = parser.parse_args(argv)
 
     output = args.output.resolve()
