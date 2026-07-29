@@ -20,9 +20,9 @@ from test_contract import _config, _label, _write_raw
 
 class SchemaGateTests(unittest.TestCase):
     def test_version_is_exactly_plan_version(self) -> None:
-        self.assertEqual(__version__, "1.7")
+        self.assertEqual(__version__, "1.8")
 
-    def test_v17_ct_failure_cases_are_the_only_supported_ct_cases(self) -> None:
+    def test_v18_ct_failure_cases_are_the_only_supported_ct_cases(self) -> None:
         self.assertEqual(
             CT_CASES,
             (
@@ -126,7 +126,7 @@ class FailureCaseTests(unittest.TestCase):
             self.assertGreaterEqual(len(result.records), 1)
             self.assertTrue(np.isfinite(np.asarray(result.image)).all())
 
-    def test_v17_case_set_and_record_types(self) -> None:
+    def test_v18_case_set_and_record_types(self) -> None:
         self.assertNotIn("rgb_alignment_failure", RGB_CASES)
         image = Image.new("RGB", (128, 96), (90, 120, 160))
         object_mask = Image.new("L", image.size, 0)

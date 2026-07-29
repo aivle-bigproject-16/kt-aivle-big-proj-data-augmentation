@@ -16,7 +16,7 @@
       verify   생성된 데이터셋을 재검증한다.
       upload   생성 산출물을 rclone 으로 원격(gdrive 등)에 올린다.
 
-  v1.7에는 사람 visual QA 게이트가 없다. generate 가 자동 검증까지 통과하면 최종
+  v1.8에는 사람 visual QA 게이트가 없다. generate 가 자동 검증까지 통과하면 최종
   산출물을 바로 만들며, resume 은 중단 복구에만 사용한다.
 
   ## 반드시 pwsh(PowerShell 7)로 실행한다
@@ -40,7 +40,7 @@
       pwsh -File .\run_pipeline.ps1 -Stage generate -RawRoot "..." -Config .\config.measured.json -Plan "D:\qf_plan\manifests\generation_plan.csv" -Output "D:\qf_full" -Detached
       pwsh -File .\run_pipeline.ps1 -Stage resume   -RawRoot "..." -Config .\config.measured.json -Plan "D:\qf_plan\manifests\generation_plan.csv" -Output "D:\qf_full" -Detached
       pwsh -File .\run_pipeline.ps1 -Stage verify   -Output "D:\qf_full"
-      pwsh -File .\run_pipeline.ps1 -Stage upload   -Output "D:\qf_full" -Remote "gdrive:quality_fail_40k_v1.7" -Detached
+      pwsh -File .\run_pipeline.ps1 -Stage upload   -Output "D:\qf_full" -Remote "gdrive:quality_fail_40k_v1.8" -Detached
 
   계획 재작성이 필요할 때(quota·seed 등 계획에 영향을 주는 config 변경):
 

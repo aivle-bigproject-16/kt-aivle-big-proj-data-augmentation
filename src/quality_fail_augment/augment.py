@@ -42,7 +42,7 @@ CASE_NAMES_KO = {
     "rgb_surface_dust": "렌즈·보호유리 먼지 오염",
     "rgb_hair_contamination": "렌즈·보호유리 섬유 오염",
 }
-SOURCE_REFERENCES = {case: f"v1.7:{case}" for case in (*CT_CASES, *RGB_CASES)}
+SOURCE_REFERENCES = {case: f"v1.8:{case}" for case in (*CT_CASES, *RGB_CASES)}
 UNEVEN_TAIL_QUANTILE = 0.20
 UNEVEN_MIN_ASYMMETRY = 0.25
 UNEVEN_MAX_ASYMMETRY = 0.60
@@ -1722,7 +1722,7 @@ def validate_augmented(
             not 1 <= int(curve["thickness_px"]) <= maximum_width
             for curve in curves
         ):
-            raise ValueError("quality_gate: hair thickness is outside v1.7 range")
+            raise ValueError("quality_gate: hair thickness is outside v1.8 range")
         long_side = max(image.size)
         if any(
             not 0.15 * long_side <= float(curve["length_px"]) <= 0.60 * long_side

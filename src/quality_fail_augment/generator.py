@@ -301,7 +301,7 @@ def _make_one(
             "augmentations": records,
             "automatic_checks": {
                 "passed": True,
-                "quality_gate_version": "v1.7",
+                "quality_gate_version": "v1.8",
                 "record_types": [record["type"] for record in records],
                 "measurements": {
                     record["type"]: record.get("parameters", {})
@@ -874,7 +874,7 @@ def generate(
         output / "generation_summary.json",
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True).encode(),
     )
-    archive_path = output / "augmentation_json_4k_v1.7.zip"
+    archive_path = output / "augmentation_json_4k_v1.8.zip"
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(output.glob("*/*/augmentation_json/*.augmentation.json")):
             archive.write(path, path.relative_to(output).as_posix())
