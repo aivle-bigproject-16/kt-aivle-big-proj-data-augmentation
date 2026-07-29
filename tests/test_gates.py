@@ -22,7 +22,7 @@ class SchemaGateTests(unittest.TestCase):
     def test_version_is_exactly_plan_version(self) -> None:
         self.assertEqual(__version__, "1.7")
 
-    def test_v16_ct_failure_cases_are_the_only_supported_ct_cases(self) -> None:
+    def test_v17_ct_failure_cases_are_the_only_supported_ct_cases(self) -> None:
         self.assertEqual(
             CT_CASES,
             (

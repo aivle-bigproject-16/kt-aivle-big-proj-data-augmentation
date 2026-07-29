@@ -4,7 +4,6 @@ import csv
 import hashlib
 import json
 import os
-import random
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
@@ -12,8 +11,9 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image
+import numpy as np
 
-from .augment import CT_CASES, RGB_CASES
+from .augment import CT_CASES, RGB_CASES, _largest_connected_component
 from .common import (
     atomic_write,
     canonical_json_bytes,
@@ -106,6 +106,14 @@ def _config_hash(config: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def _pcg64_shuffle(values: list[Any], seed: int) -> None:
+    """Shuffle in place with the v1.7 canonical NumPy PCG64 generator."""
+    if len(values) < 2:
+        return
+    order = np.random.Generator(np.random.PCG64(seed)).permutation(len(values))
+    values[:] = [values[int(index)] for index in order]
 
 
 # scan 캐시 스키마 버전. _validate_pair 가 쓰는 검증 로직 — open_normalized, pixel_hash,
@@ -715,6 +723,18 @@ def scan(
 
 
 def _validate_config(config: dict[str, Any]) -> None:
+    if str(config.get("rng_algorithm", "PCG64")).upper() != "PCG64":
+        raise ValueError("rng_algorithm must be PCG64")
+    if str(config.get("conveyor_axis", "horizontal")).casefold() not in {
+        "horizontal",
+        "vertical",
+    }:
+        raise ValueError("conveyor_axis must be horizontal or vertical")
+    if str(config.get("forward_direction", "positive")).casefold() not in {
+        "positive",
+        "negative",
+    }:
+        raise ValueError("forward_direction must be positive or negative")
     for modality, allowed in (("ct", CT_CASES), ("rgb", RGB_CASES)):
         target = int(config[f"{modality}_target"])
         fail_target = int(config[f"{modality}_augmented_target"])
@@ -733,7 +753,7 @@ def _validate_config(config: dict[str, Any]) -> None:
 def _case_assignments(config: dict[str, Any], modality: str) -> list[str]:
     quotas = config[f"{modality.lower()}_failure_case_quotas"]
     cases = [case for case, count in quotas.items() for _ in range(int(count))]
-    random.Random(stable_seed(config["seed"], modality, "failure-cases")).shuffle(cases)
+    _pcg64_shuffle(cases, stable_seed(config["seed"], modality, "failure-cases"))
     return cases
 
 
@@ -751,6 +771,16 @@ def _fingerprint(candidates: list[Candidate], raw_root: Path) -> str:
             ).encode()
         )
     return digest.hexdigest()
+
+
+def _has_dense_ct_anchor(candidate: Candidate) -> bool:
+    image = open_normalized(candidate.image_path, "CT")
+    if candidate.roi is not None:
+        image = image.crop(tuple(int(round(value)) for value in candidate.roi))
+    array = np.asarray(image.convert("L"), dtype=np.float32)
+    threshold = float(np.quantile(array, 0.99))
+    component = _largest_connected_component(array >= threshold)
+    return float(component.mean()) >= 0.001
 
 
 def audit_raw(
@@ -828,6 +858,12 @@ def create_plan(
         "CT": int(config["ct_image_id_start"]),
         "RGB": int(config["rgb_image_id_start"]),
     }
+    dense_anchor_cache: dict[Path, bool] = {}
+
+    def has_dense_anchor(candidate: Candidate) -> bool:
+        if candidate.image_path not in dense_anchor_cache:
+            dense_anchor_cache[candidate.image_path] = _has_dense_ct_anchor(candidate)
+        return dense_anchor_cache[candidate.image_path]
     for modality in ("CT", "RGB"):
         target = int(config[f"{modality.lower()}_target"])
         fail_target = int(config[f"{modality.lower()}_augmented_target"])
@@ -839,22 +875,71 @@ def create_plan(
                 normalized_relative(candidate.image_path, raw_root),
             )
         )
-        random.Random(stable_seed(config["seed"], modality, "extract")).shuffle(pool)
+        _pcg64_shuffle(pool, stable_seed(config["seed"], modality, "extract"))
         if len(pool) < target + reserve:
             raise ValueError(
                 f"{modality}: needs {target + reserve} valid unique sources including reserve, "
                 f"found {len(pool)}"
             )
-        chosen, reserves = pool[:target], pool[target : target + reserve]
         shuffled = list(range(target))
-        random.Random(stable_seed(config["seed"], modality, "assignment")).shuffle(shuffled)
+        _pcg64_shuffle(shuffled, stable_seed(config["seed"], modality, "assignment"))
         fail_indices = set(shuffled[:fail_target])
         case_values = _case_assignments(config, modality)
         case_by_index = dict(zip(sorted(fail_indices), case_values, strict=True))
+        available = list(pool[: target + reserve])
+        chosen: list[Candidate] = []
+        for index in range(target):
+            failure_case = case_by_index.get(index, "")
+            eligible_index = 0
+            if failure_case == "ct_cell_alignment_failure":
+                eligible_index = next(
+                    (
+                        position
+                        for position, candidate in enumerate(available)
+                        if candidate.porosity_component_count > 0
+                    ),
+                    -1,
+                )
+                if eligible_index < 0:
+                    raise ValueError(
+                        "CT alignment quota cannot be filled from porosity sources"
+                    )
+            elif failure_case == "ct_beam_hardening_metal_streak":
+                eligible_index = next(
+                    (
+                        position
+                        for position, candidate in enumerate(available)
+                        if has_dense_anchor(candidate)
+                    ),
+                    -1,
+                )
+                if eligible_index < 0:
+                    raise ValueError(
+                        "CT metal-streak quota cannot be filled from dense-anchor sources"
+                    )
+            elif failure_case == "rgb_reflection_glare":
+                eligible_index = next(
+                    (
+                        position
+                        for position, candidate in enumerate(available)
+                        if bool(
+                            (candidate.label.get("swelling") or {}).get(
+                                "battery_outline"
+                            )
+                        )
+                    ),
+                    -1,
+                )
+                if eligible_index < 0:
+                    raise ValueError(
+                        "RGB glare quota cannot be filled from outline sources"
+                    )
+            chosen.append(available.pop(eligible_index))
+        reserves = available
         fail_order = list(sorted(fail_indices))
         pass_order = [index for index in range(target) if index not in fail_indices]
-        random.Random(stable_seed(config["seed"], modality, "test-fail")).shuffle(fail_order)
-        random.Random(stable_seed(config["seed"], modality, "test-pass")).shuffle(pass_order)
+        _pcg64_shuffle(fail_order, stable_seed(config["seed"], modality, "test-fail"))
+        _pcg64_shuffle(pass_order, stable_seed(config["seed"], modality, "test-pass"))
         test_indices = set(
             fail_order[: int(config.get(f"{modality.lower()}_test_fail_target", 0))]
             + pass_order[
@@ -874,12 +959,33 @@ def create_plan(
             fail = index in fail_indices
             partition = "test" if index in test_indices else "main"
             image_id = image_starts[modality] + index
+            synthetic_id = f"QF17_{modality}_{slot:08d}"
+            failure_case = case_by_index.get(index, "")
+            item_seed = stable_seed(config["seed"], synthetic_id)
+            case_seed = stable_seed(item_seed, failure_case) if failure_case else item_seed
+            group_key = (
+                f"{candidate.parsed.battery_id}|{candidate.parsed.axis}"
+                if modality == "CT"
+                else ""
+            )
+            group_seed = (
+                stable_seed(
+                    config["seed"],
+                    candidate.parsed.battery_id,
+                    candidate.parsed.axis,
+                    failure_case,
+                )
+                if modality == "CT" and failure_case
+                else ""
+            )
             row = {
-                "synthetic_id": f"QF15_{modality}_{slot:08d}",
+                "synthetic_id": synthetic_id,
                 "modality": modality,
                 "raw_split": candidate.raw_split,
                 "raw_image_path": normalized_relative(candidate.image_path, raw_root),
                 "raw_json_path": normalized_relative(candidate.json_path, raw_root),
+                "source_image_relative_path": normalized_relative(candidate.image_path, raw_root),
+                "source_json_relative_path": normalized_relative(candidate.json_path, raw_root),
                 "source_stem": candidate.image_path.stem,
                 "form": candidate.parsed.form,
                 "axis": candidate.parsed.axis,
@@ -889,11 +995,15 @@ def create_plan(
                 "new_image_id": image_id,
                 "assignment": "augmented" if fail else "original",
                 "quality_label": "fail" if fail else "pass",
+                "quality_class": "fail" if fail else "pass",
                 "partition": partition,
-                "failure_case": case_by_index.get(index, ""),
+                "failure_case": failure_case,
                 "selected": "true",
                 "extraction_rank": slot,
-                "item_seed": stable_seed(config["seed"], modality, slot),
+                "item_seed": item_seed,
+                "case_seed": case_seed,
+                "group_key": group_key,
+                "group_seed": group_seed,
                 "image_sha256": candidate.image_sha256,
                 "json_sha256": candidate.json_sha256,
                 "pixel_hash": candidate.pixel_hash,
