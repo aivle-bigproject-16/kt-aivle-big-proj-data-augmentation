@@ -57,6 +57,36 @@ v1.7에는 사람 visual QA 게이트가 없다. `generate`가 자동 검증까�
 
 ### scan 캐시 — plan 재실행 비용 줄이기
 
+v1.7의 scan cache v2는 RGB glare 원본 적격성을 다시 판단할 수 있도록
+`has_battery_outline`을 함께 저장한다. 기존 v1 캐시에는 이 열이 없으므로 최초 한 번은
+`-ReuseScan` 없이 전체 원본을 다시 스캔해야 한다. 이 실행이 완료되면
+`<Output>\manifests\scan_cache.csv`가 생성되고, 다음 plan부터 그 파일을 `--reuse-scan`으로
+지정한다.
+
+`run_pipeline.ps1`은 PowerShell 7 이상이 필요하다. `pwsh`가 없는 Windows PowerShell
+5에서는 아래처럼 가상환경의 Python CLI를 직접 실행한다.
+
+```powershell
+# 최초 1회: 기존 캐시를 지정하지 않고 v2 캐시 생성
+& ".\.venv\Scripts\python.exe" -m quality_fail_augment.cli plan `
+  --raw-root "E:\103.배터리 불량 이미지 데이터" `
+  --config ".\config.40k.json" `
+  --output "E:\quality_fail_40k_plan_v1.7_cache_v2"
+
+# 다음 plan부터: 최초 실행에서 생성한 v2 캐시 재사용
+& ".\.venv\Scripts\python.exe" -m quality_fail_augment.cli plan `
+  --raw-root "E:\103.배터리 불량 이미지 데이터" `
+  --config ".\config.40k.json" `
+  --reuse-scan "E:\quality_fail_40k_plan_v1.7_cache_v2\manifests\scan_cache.csv" `
+  --output "E:\quality_fail_40k_plan_v1.7_next"
+```
+
+첫 실행에는 시간이 오래 걸리는 것이 정상이다. 두 번째 실행부터는 변경되지 않은
+image–JSON pair를 v2 캐시에서 복원한다. 기존 v1 캐시를 `--reuse-scan`으로 지정하면 스키마
+불일치 오류가 발생하므로 사용하지 않는다. 직접 실행 로그는 각 출력 폴더의
+`logs\plan.log`에도 저장된다. PowerShell 7이 설치된 환경에서는 아래 자동 파이프라인
+절의 `pwsh -File .\run_pipeline.ps1 ...` 명령을 사용할 수 있다.
+
 `plan`의 시간은 거의 전부 2단계인 쌍 검증이다. 원본 파일 탐색은 4분이지만, 쌍 276,170건을
 각각 이미지 전량 디코드 + 이미지·JSON SHA-256 + 픽셀 해시로 검증하는 데 약 60분이 든다.
 
@@ -67,9 +97,9 @@ v1.7에는 사람 visual QA 게이트가 없다. `generate`가 자동 검증까�
 ```powershell
 quality-fail-augment plan `
   --raw-root "E:\103.배터리 불량 이미지 데이터" `
-  --config ".\config.40k.v2.json" `
-  --reuse-scan "E:\quality_fail_40k_plan_v1.7\manifests\scan_cache.csv" `
-  --output "E:\quality_fail_40k_plan_v2"
+  --config ".\config.40k.json" `
+  --reuse-scan "E:\quality_fail_40k_plan_v1.7_cache_v2\manifests\scan_cache.csv" `
+  --output "E:\quality_fail_40k_plan_v1.7_next"
 ```
 
 캐시가 온전히 적중하면 plan은 약 60분에서 몇 분으로 줄고, `generation_plan.csv`는
