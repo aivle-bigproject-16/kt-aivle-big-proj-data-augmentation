@@ -28,6 +28,7 @@ class PreparedSource:
     object_mask: Image.Image
     defect_mask: Image.Image
     original_roi: list[float] | None
+    porosity_mask: Image.Image | None = None
 
 
 @dataclass
@@ -96,6 +97,24 @@ def _defect_mask(
     return combined
 
 
+def _porosity_mask(
+    label: dict[str, Any], transform: Affine, size: tuple[int, int]
+) -> Image.Image:
+    combined = Image.new("L", size, 0)
+    for defect in label.get("defects") or []:
+        name = str(
+            defect.get("name", defect.get("class", defect.get("label", "")))
+        ).strip().casefold()
+        if name != "porosity":
+            continue
+        mask = _draw_polygon_mask(defect.get("points"), transform, size)
+        combined = Image.fromarray(
+            np.maximum(np.asarray(combined), np.asarray(mask)).astype(np.uint8),
+            mode="L",
+        )
+    return combined
+
+
 def prepare_source(
     image_path: Path, json_path: Path, modality: str
 ) -> PreparedSource:
@@ -120,6 +139,7 @@ def prepare_source(
         transform=transform,
         object_mask=_object_mask(label, transform, image.size, image),
         defect_mask=_defect_mask(label, transform, image.size),
+        porosity_mask=_porosity_mask(label, transform, image.size),
         original_roi=original_roi,
     )
 
@@ -157,7 +177,14 @@ def apply_quality_transform(
                 failure_case,
                 stable_seed(item_seed, "retry", attempt),
                 object_mask=source.object_mask,
-                defect_mask=source.defect_mask,
+                defect_mask=(
+                    source.porosity_mask
+                    if modality == "CT"
+                    and failure_case == "ct_cell_alignment_failure"
+                    and source.porosity_mask is not None
+                    and source.porosity_mask.getbbox() is not None
+                    else source.defect_mask
+                ),
             )
             return TransformedSample(
                 image=result.image,

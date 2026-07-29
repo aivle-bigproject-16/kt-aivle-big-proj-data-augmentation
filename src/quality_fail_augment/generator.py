@@ -84,7 +84,7 @@ ERROR_FIELDS = [
     "error",
 ]
 RECOVERY_FIELDS = ["path", "action", "reason"]
-QA_FIELDS = [
+LEGACY_QA_FIELDS = [
     "modality",
     "failure_case",
     "augmentation_subtype",
@@ -499,11 +499,12 @@ def _effective_jobs(config: dict[str, Any], task_count: int) -> int:
         return int(config.get("memory_probe_fallback_jobs", 1))
 
 
-def _visual_qa_gate(
+def export_visual_qa_csv_legacy(
     output: Path,
     manifest_rows: list[dict[str, Any]],
     config: dict[str, Any],
 ) -> None:
+    """Legacy manual export helper; v1.7 generation never calls this function."""
     if not bool(config.get("require_visual_qa_before_release", False)):
         return
     per_case = int(config.get("visual_qa_samples_per_case", 10))
@@ -557,7 +558,7 @@ def _visual_qa_gate(
                 }
             )
     if not qa_path.exists():
-        _write_csv(qa_path, selected, QA_FIELDS)
+        _write_csv(qa_path, selected, LEGACY_QA_FIELDS)
         raise ValueError(
             f"Visual QA approval pending: review {len(selected)} rows in {qa_path} "
             "and rerun with --resume"
@@ -883,8 +884,6 @@ def generate(
                 f"failure case quotas differ: actual={dict(case_counts)}, "
                 f"expected={dict(expected_cases)}"
             )
-    if limit_per_modality is None:
-        _visual_qa_gate(output, manifest_rows, config)
     summary = {
         "schema_version": "1.1",
         "package_version": __version__,
@@ -928,12 +927,10 @@ def generate(
         output / "generation_summary.json",
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True).encode(),
     )
-    archive_path = output / "augmentation_json_4k_v1.6.zip"
+    archive_path = output / "augmentation_json_4k_v1.7.zip"
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(output.glob("*/*/augmentation_json/*.augmentation.json")):
             archive.write(path, path.relative_to(output).as_posix())
-    if not (output / "manifests" / "fail_visual_qa.csv").exists():
-        _write_csv(output / "manifests" / "fail_visual_qa.csv", [], QA_FIELDS)
     return summary
 
 

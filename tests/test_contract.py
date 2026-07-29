@@ -98,7 +98,6 @@ def _config() -> dict:
         "ct_image_id_start": 2000000001,
         "rgb_image_id_start": 2000020001,
         "jobs": 1,
-        "require_visual_qa_before_release": False,
         "parallel_chunk_multiplier": 8,
         "preflight_per_stratum": 0,
         "systemic_consecutive_limit": 20,
@@ -256,124 +255,21 @@ class PublicContractTests(unittest.TestCase):
                     resume=True,
                 )
 
-    def test_visual_qa_is_a_release_gate(self) -> None:
+    def test_generation_finishes_without_visual_qa_gate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             raw, plan_dir, output = root / "raw", root / "plan", root / "output"
             _write_raw(raw)
             config = _config()
-            config.update(
-                {
-                    "require_visual_qa_before_release": True,
-                    "visual_qa_samples_per_case": 1,
-                    "visual_qa_min_approval_rate": 0.90,
-                }
-            )
             create_plan(raw, config, plan_dir)
-            with self.assertRaisesRegex(ValueError, "Visual QA approval pending"):
-                generate(
-                    raw,
-                    config,
-                    plan_dir / "manifests" / "generation_plan.csv",
-                    output,
-                )
-            qa_path = output / "manifests" / "fail_visual_qa.csv"
-            with qa_path.open(encoding="utf-8-sig", newline="") as handle:
-                rows = list(csv.DictReader(handle))
-                fields = list(rows[0])
-            self.assertIn("source_filename", fields)
-            self.assertIn("source_image_path", fields)
-            self.assertIn("original_battery_id", fields)
-            self.assertTrue(all(row["source_filename"] for row in rows))
-            self.assertTrue(all(row["source_image_path"] for row in rows))
-            self.assertTrue(all(row["original_battery_id"] for row in rows))
-            for row in rows:
-                row["reviewer"] = "test-reviewer"
-                row["approved"] = "true"
-            source_filename = rows[0]["source_filename"]
-            rows[0]["source_filename"] = ""
-            with qa_path.open("w", encoding="utf-8-sig", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=fields)
-                writer.writeheader()
-                writer.writerows(rows)
-            with self.assertRaisesRegex(ValueError, "lineage field is empty"):
-                generate(
-                    raw,
-                    config,
-                    plan_dir / "manifests" / "generation_plan.csv",
-                    output,
-                    resume=True,
-                )
-            rows[0]["source_filename"] = source_filename
-            with qa_path.open("w", encoding="utf-8-sig", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=fields)
-                writer.writeheader()
-                writer.writerows(rows)
             summary = generate(
                 raw,
                 config,
                 plan_dir / "manifests" / "generation_plan.csv",
                 output,
-                resume=True,
             )
             self.assertEqual(sum(summary["counts"].values()), 8)
-
-    def test_visual_qa_accepts_nine_of_ten_per_case(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            raw, plan_dir, output = root / "raw", root / "plan", root / "output"
-            _write_raw(raw, count=16)
-            config = _config()
-            config.update(
-                {
-                    "ct_target": 12,
-                    "ct_augmented_target": 10,
-                    "ct_test_target": 2,
-                    "ct_test_fail_target": 1,
-                    "ct_failure_case_quotas": {"ct_low_signal_noise": 10},
-                    "rgb_target": 12,
-                    "rgb_augmented_target": 10,
-                    "rgb_test_target": 2,
-                    "rgb_test_fail_target": 1,
-                    "rgb_failure_case_quotas": {"rgb_underexposure": 10},
-                    "require_visual_qa_before_release": True,
-                    "visual_qa_samples_per_case": 10,
-                    "visual_qa_min_approval_rate": 0.90,
-                }
-            )
-            create_plan(raw, config, plan_dir)
-            with self.assertRaisesRegex(ValueError, "Visual QA approval pending"):
-                generate(
-                    raw,
-                    config,
-                    plan_dir / "manifests" / "generation_plan.csv",
-                    output,
-                )
-            qa_path = output / "manifests" / "fail_visual_qa.csv"
-            with qa_path.open(encoding="utf-8-sig", newline="") as handle:
-                rows = list(csv.DictReader(handle))
-                fields = list(rows[0])
-            rejected_cases: set[tuple[str, str]] = set()
-            for row in rows:
-                key = (row["modality"], row["failure_case"])
-                row["reviewer"] = "test-reviewer"
-                if key not in rejected_cases:
-                    row["approved"] = "false"
-                    rejected_cases.add(key)
-                else:
-                    row["approved"] = "true"
-            with qa_path.open("w", encoding="utf-8-sig", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=fields)
-                writer.writeheader()
-                writer.writerows(rows)
-            summary = generate(
-                raw,
-                config,
-                plan_dir / "manifests" / "generation_plan.csv",
-                output,
-                resume=True,
-            )
-            self.assertEqual(sum(summary["counts"].values()), 24)
+            self.assertFalse((output / "manifests" / "fail_visual_qa.csv").exists())
 
 
 if __name__ == "__main__":

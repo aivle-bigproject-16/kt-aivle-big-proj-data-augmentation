@@ -940,7 +940,7 @@ def create_plan(
     )
     metadata = {
         "schema_version": "1.1",
-        "package_version": "1.6",
+        "package_version": "1.7",
         "raw_fingerprint": fingerprint,
         "config_sha256": config_hash,
         "plan_rows": len(plan_rows),
