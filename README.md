@@ -28,9 +28,11 @@ ID, 파일명, 출력 크기, `quality_class`, 변환된 polygon 좌표를 갖�
 [1] audit-raw   원본을 읽기 전용으로 훑어 이 코드가 다룰 수 있는 데이터인지 확인
        ↓        산출: 감사 리포트 (원본은 건드리지 않는다)
 [2] plan        원본 전량 스캔 → 어떤 원본이 어떤 출력이 될지 전부 확정
-       ↓        산출: generation_plan.csv, reserve_sources.csv, raw fingerprint
+       ↓        산출: generation_plan.csv, reserve_sources.csv, raw fingerprint,
+       ↓              scan_cache.csv (다음 plan 에서 --reuse-scan 으로 재사용)
 [3] smoke       소량 생성으로 워커 메모리 실측 → 병렬 워커 수 결정용 config 확보
        ↓        산출: generation_summary.json 의 worker_peak_rss_bytes_observed
+       ↓        측정값은 성능 전용 키라 [2] 의 plan 을 무효화하지 않는다
 [4] generate    plan 대로 40,000장 생성 → 자동 검증 → 사람 visual QA 게이트에서 정지
        ↓        산출: 이미지·라벨·이력 전량, manifests/, fail_visual_qa.csv
 [5] resume      사람이 채운 QA CSV 를 검사 → 통과하면 최종 산출물 공개
@@ -46,8 +48,46 @@ ID, 파일명, 출력 크기, `quality_class`, 변환된 polygon 좌표를 갖�
 - `plan`이 원본 전체의 fingerprint를 기록한다. `generate`는 실행 시작 시 원본을 다시 스캔해
   fingerprint가 같은지 대조하고, 다르면 생성을 거부한다.
 - config 파일이 바뀌면 `config_sha256`이 바뀌고, 승인된 plan과 불일치하므로 역시 거부한다.
-  성능 전용 키(`worker_peak_rss_bytes` 등)를 추가해도 해시가 바뀌므로 plan을 다시 만들어야 한다.
+  단 산출물에 영향을 주지 않는 **성능 전용 키는 해시 재료에서 제외**한다
+  (`planner.PERFORMANCE_ONLY_KEYS`). 그래서 smoke가 측정한 `worker_peak_rss_bytes`를
+  config에 넣어도 승인된 plan이 그대로 유효하다. 목록에 없는 키는 전부 해시에 남으므로,
+  새 키를 추가하면 기본적으로 plan이 무효화되는 안전한 방향으로 동작한다.
 - 샘플마다 `item_seed`가 고정이라, 같은 코드·같은 plan이면 같은 이미지가 나온다.
+
+### scan 캐시 — plan 재실행 비용 줄이기
+
+`plan`의 시간은 거의 전부 2단계인 쌍 검증이다. 원본 파일 탐색은 4분이지만, 쌍 276,170건을
+각각 이미지 전량 디코드 + 이미지·JSON SHA-256 + 픽셀 해시로 검증하는 데 약 60분이 든다.
+
+`plan`과 `audit-raw`는 그 결과를 `manifests/scan_cache.csv`로 남긴다. 다음 실행에
+`--reuse-scan`으로 그 파일(또는 그것을 담은 디렉터리)을 주면, 이미지와 JSON의 크기·수정시각이
+그대로인 쌍은 캐시에서 가져오고 나머지만 검증한다.
+
+```powershell
+quality-fail-augment plan `
+  --raw-root "E:\103.배터리 불량 이미지 데이터" `
+  --config ".\config.40k.v2.json" `
+  --reuse-scan "E:\quality_fail_40k_plan_v1.6\manifests\scan_cache.csv" `
+  --output "E:\quality_fail_40k_plan_v2"
+```
+
+캐시가 온전히 적중하면 plan은 약 60분에서 몇 분으로 줄고, `generation_plan.csv`는
+전체 재스캔으로 만든 것과 **바이트 단위로 동일**하다(`tests/test_scan_cache.py`).
+
+무효화 규칙:
+
+| 바뀐 것 | 캐시 유효 |
+|---|---|
+| quota·seed·target 등 계획용 config 키 | 유효. scan은 이 값들을 읽지 않는다 |
+| `ct_porosity_threshold` | 유효. 다공성 비율 원값을 캐시하므로 임계값만 다시 적용한다 |
+| 원본 파일 추가·삭제·수정 | 해당 쌍만 무효. 1단계 탐색과 크기·수정시각 대조로 잡는다 |
+| `_validate_pair`가 쓰는 검증 로직 | 전부 무효. `planner.SCAN_CACHE_VERSION`을 올려야 한다 |
+
+신선도를 크기·수정시각으로만 판정하는 것은 의도적이다. SHA-256 재계산이 바로 이 캐시가
+없애려는 비용이기 때문이다. 대신 plan에 실제로 선택된 40k+reserve 소스는 `generate`가
+`--trust-plan`이어도 SHA-256으로 다시 pin 검증하므로(`_validate_plan`), 실제 사용되는
+소스의 무결성은 그대로 보장된다. 미선택 소스까지 전량 재해싱하고 싶으면
+`--reuse-scan` 없이 돌리면 된다.
 
 ## 코드 구조
 
@@ -186,11 +226,32 @@ quality-fail-augment generate `
 
 ### 배포와 회수
 
-검수를 팀에 맡길 때는 다음 세 가지를 함께 넘긴다.
+검수자에게 40,000장 전체를 넘길 수는 없으므로, 표본만 모은 번들을 만들어 넘긴다.
 
-- `manifests/fail_visual_qa.csv` (빈 상태)
-- 표본 140장의 이미지
-- 위 판정 기준
+```powershell
+python .\review_tools\build_qa_bundle.py `
+  --output "E:\quality_fail_40k_v1.6" --config .\config.40k.json
+```
+
+`<output>-qa_bundle\`에 네 가지가 생긴다.
+
+| 파일 | 용도 |
+|---|---|
+| `review_tool.html` | 표본 이미지를 data URI로 품은 자체 완결 검수 UI. 파일 하나만 옮겨도 검수가 된다 |
+| `fail_visual_qa.csv` | 빈 판정 CSV. 툴을 쓰지 않고 직접 채워도 된다 |
+| `images/` | 표본 사본. 이름은 `<synthetic_id>__<원래 파일명>`이라 CSV 행과 1:1로 맞는다 |
+| `README.txt` | 판정 기준과 회수 절차. 표본 수와 승인 기준은 config에서 읽어 채운다 |
+
+검수 UI는 케이스별로 묶어 보여주고, 승인/거부를 `A`/`R` 키로 넘긴다. CT는 어둡고 폭이
+좁아 원본 대비로는 결함이 묻히므로 대비 프리셋·확대·반전을 제공한다. 판정은 브라우저에
+자동 저장되어 중간에 닫아도 된다. "CSV 내보내기"가 `generator.py`와 같은 11칸 스키마로
+쓰므로 `merge_and_check.py`에 그대로 넣을 수 있다.
+
+여러 명이 나눠 검수했다면 각자의 CSV를 병합하고 승인율을 미리 판정한다.
+
+```powershell
+python .\review_tools\merge_and_check.py reviews\*.csv
+```
 
 검수자가 채운 CSV를 받아 `manifests/fail_visual_qa.csv` 자리에 덮어쓰고 `--resume`으로
 재개한다. 게이트는 CSV가 이미 존재하면 새로 만들지 않고 그 내용을 검사한다.
@@ -300,16 +361,17 @@ pwsh -File .\run_pipeline.ps1 -Stage smoke `
   -Plan "E:\quality_fail_40k_plan_v1.6\manifests\generation_plan.csv" `
   -Output "E:\quality_fail_40k_smoke_v1.6" -Detached
 
-# 3) 측정 config 로 plan 을 다시 만든 뒤 full 생성. QA 게이트에서 멈춘다(exit=10).
+# 3) 측정 config 로 full 생성. QA 게이트에서 멈춘다(exit=10).
+#    측정값은 성능 전용 키라 plan 해시를 바꾸지 않으므로, 1) 의 plan 을 그대로 쓴다.
 pwsh -File .\run_pipeline.ps1 -Stage generate `
   -RawRoot "E:\103.배터리 불량 이미지 데이터" -Config .\config.40k.measured.json `
-  -Plan "E:\quality_fail_40k_plan2_v1.6\manifests\generation_plan.csv" `
+  -Plan "E:\quality_fail_40k_plan_v1.6\manifests\generation_plan.csv" `
   -Output "E:\quality_fail_40k_v1.6" -Detached
 
 # 4) 사람이 fail_visual_qa.csv 를 채운 뒤 재개 → 최종 ZIP 공개
 pwsh -File .\run_pipeline.ps1 -Stage resume `
   -RawRoot "E:\103.배터리 불량 이미지 데이터" -Config .\config.40k.measured.json `
-  -Plan "E:\quality_fail_40k_plan2_v1.6\manifests\generation_plan.csv" `
+  -Plan "E:\quality_fail_40k_plan_v1.6\manifests\generation_plan.csv" `
   -Output "E:\quality_fail_40k_v1.6" -Detached
 
 # 5) 원격(gdrive 등) 업로드

@@ -4,15 +4,18 @@
 
   ## 스테이지
 
-      plan     결정론적 plan 생성(병렬 scan). generation_plan.csv 를 만든다.
+      plan     결정론적 plan 생성(병렬 scan). generation_plan.csv 와 scan_cache.csv 를
+               만든다. -ReuseScan 으로 앞선 plan 의 scan_cache.csv 를 주면 원본이 그대로인
+               쌍의 검증(약 60분)을 건너뛴다.
       smoke    소규모(기본 100장/모달리티) 생성으로 worker_peak_rss_bytes 를 측정하고,
-               측정값을 넣은 <config>.measured.json 을 만든다. 이 config 로 plan 을 다시
-               만들면 이후 full 생성이 병렬 worker 로 돈다.
+               측정값을 넣은 <config>.measured.json 을 만든다. 이 키는 plan 해시 재료에서
+               빠져 있으므로(planner.PERFORMANCE_ONLY_KEYS), 측정 config 로 바꿔도 이미
+               승인된 plan 이 그대로 유효하다. 재-plan 이 필요 없다.
       generate 승인된 plan 으로 전체 생성. 완료 후 fail_visual_qa.csv 가 만들어지고
-               "Visual QA approval pending" 으로 멈춘다(정상). 사람이 510장을 검토해
+               "Visual QA approval pending" 으로 멈춘다(정상). 사람이 140장을 검토해
                reviewer 와 approved 를 채워야 한다. 이 단계는 사람 게이트를 대신 통과할
                수 없다.
-      resume   사람이 QA CSV 를 채운 뒤 실행한다. case 별 승인율이 95% 이상이면 최종
+      resume   사람이 QA CSV 를 채운 뒤 실행한다. case 별 승인율이 90% 이상이면 최종
                ZIP 과 완료 summary 를 공개한다.
       verify   생성된 데이터셋을 재검증한다.
       upload   생성 산출물을 rclone 으로 원격(gdrive 등)에 올린다.
@@ -20,7 +23,7 @@
   ## 참고 레포와 다른 점
 
   전처리 파이프라인의 approve 단계는 사람 이름만 기록하면 통과하지만, 이 레포의
-  visual-QA 게이트는 사람이 실제로 510장을 보고 case 별 95% 승인을 채워야 한다.
+  visual-QA 게이트는 사람이 실제로 140장을 보고 case 별 90% 승인을 채워야 한다.
   스크립트는 그 검토를 자동화하지 않는다. generate 가 멈추면 사람이 CSV 를 채운 뒤
   resume 를 부른다.
 
@@ -42,10 +45,15 @@
 
       pwsh -File .\run_pipeline.ps1 -Stage plan     -RawRoot "..." -Config .\config.40k.json -Output "D:\qf_plan" -Detached
       pwsh -File .\run_pipeline.ps1 -Stage smoke    -RawRoot "..." -Config .\config.40k.json -Plan "D:\qf_plan\manifests\generation_plan.csv" -Output "D:\qf_smoke" -Detached
-      pwsh -File .\run_pipeline.ps1 -Stage generate -RawRoot "..." -Config .\config.measured.json -Plan "D:\qf_plan2\manifests\generation_plan.csv" -Output "D:\qf_full" -Detached
-      pwsh -File .\run_pipeline.ps1 -Stage resume   -RawRoot "..." -Config .\config.measured.json -Plan "D:\qf_plan2\manifests\generation_plan.csv" -Output "D:\qf_full" -Detached
+      pwsh -File .\run_pipeline.ps1 -Stage generate -RawRoot "..." -Config .\config.measured.json -Plan "D:\qf_plan\manifests\generation_plan.csv" -Output "D:\qf_full" -Detached
+      pwsh -File .\run_pipeline.ps1 -Stage resume   -RawRoot "..." -Config .\config.measured.json -Plan "D:\qf_plan\manifests\generation_plan.csv" -Output "D:\qf_full" -Detached
       pwsh -File .\run_pipeline.ps1 -Stage verify   -Output "D:\qf_full"
-      pwsh -File .\run_pipeline.ps1 -Stage upload   -Output "D:\qf_full" -Remote "gdrive:quality_fail_40k_v1.5" -Detached
+      pwsh -File .\run_pipeline.ps1 -Stage upload   -Output "D:\qf_full" -Remote "gdrive:quality_fail_40k_v1.6" -Detached
+
+  계획 재작성이 필요할 때(quota·seed 등 계획에 영향을 주는 config 변경):
+
+      pwsh -File .\run_pipeline.ps1 -Stage plan -RawRoot "..." -Config .\config.40k.v2.json `
+        -ReuseScan "D:\qf_plan\manifests\scan_cache.csv" -Output "D:\qf_plan_v2" -Detached
 #>
 param(
     [ValidateSet("plan", "smoke", "generate", "resume", "verify", "upload")]
@@ -57,6 +65,7 @@ param(
     [string]$Remote,
     [int]$LimitPerModality = 100,
     [string]$DropCases,
+    [string]$ReuseScan,
     [switch]$TrustPlan,
     [switch]$KeepDisplay,
     [switch]$Detached
@@ -70,7 +79,7 @@ $ErrorActionPreference = "Stop"
 if ($Detached) {
     function Quote([string]$value) { '"' + $value + '"' }
     $forward = @("-ExecutionPolicy", "Bypass", "-NonInteractive", "-File", (Quote $PSCommandPath), "-Stage", $Stage)
-    foreach ($name in @("RawRoot", "Config", "Plan", "Output", "Remote", "DropCases")) {
+    foreach ($name in @("RawRoot", "Config", "Plan", "Output", "Remote", "DropCases", "ReuseScan")) {
         $value = Get-Variable -Name $name -ValueOnly -ErrorAction SilentlyContinue
         if ($value) { $forward += @("-$name", (Quote $value)) }
     }
@@ -163,6 +172,8 @@ switch ($Stage) {
     "plan" {
         if (-not $RawRoot -or -not $Config) { Write-Error "-RawRoot 와 -Config 필요"; exit 2 }
         $cliArgs = @("plan", "--raw-root", $RawRoot, "--config", $Config, "--output", $Output)
+        # 앞선 plan 의 scan_cache.csv 를 재사용해 쌍 검증(약 60분)을 건너뛴다.
+        if ($ReuseScan) { $cliArgs += @("--reuse-scan", $ReuseScan) }
     }
     "smoke" {
         if (-not $RawRoot -or -not $Config -or -not $Plan) { Write-Error "-RawRoot·-Config·-Plan 필요"; exit 2 }
@@ -214,8 +225,10 @@ try {
     else {
         & $python -X utf8 -u -m "quality_fail_augment.cli" @cliArgs *>&1 | Tee-Object -FilePath $log -Append
         $exit = $LASTEXITCODE
-        # generate 가 사람 QA 게이트에서 멈춘 경우는 실패가 아니라 대기다.
-        if ($Stage -eq "generate" -and $exit -ne 0 -and (Select-String -Path $log -Pattern "Visual QA approval pending" -Quiet)) {
+        # 사람 QA 게이트에서 멈춘 경우는 실패가 아니라 대기다. resume 도 마찬가지다.
+        # 앞선 generate 가 QA CSV 를 만들기 전에 죽었다면, resume 가 그 CSV 를 처음
+        # 만들면서 같은 대기 상태로 멈춘다.
+        if ($Stage -in @("generate", "resume") -and $exit -ne 0 -and (Select-String -Path $log -Pattern "Visual QA approval pending" -Quiet)) {
             $exit = 10
         }
         # smoke 성공 시 측정 config 를 만든다.
@@ -237,9 +250,9 @@ finally {
         Add-Content -Path $status
 }
 
-if ($Stage -eq "generate" -and $exit -eq 10) {
+if ($Stage -in @("generate", "resume") -and $exit -eq 10) {
     Write-Host "generate 완료 후 Visual QA 게이트 대기." -ForegroundColor Yellow
-    Write-Host "사람이 검토: $Output\manifests\fail_visual_qa.csv (510장, reviewer·approved 채우기)" -ForegroundColor Yellow
+    Write-Host "사람이 검토: $Output\manifests\fail_visual_qa.csv (140장, reviewer·approved 채우기)" -ForegroundColor Yellow
     Write-Host "채운 뒤: -Stage resume 실행" -ForegroundColor Yellow
     exit 10
 }
