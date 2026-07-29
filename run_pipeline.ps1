@@ -138,21 +138,32 @@ print(f'measured worker_peak_rss_bytes={rss} -> {sys.argv[3]}')
     return $measured
 }
 
+# Invoke-Upload 안의 안내 문구는 파이프라인으로 흘리면 안 된다. 함수의 반환값이
+# rclone 종료 코드 하나가 아니라 그 문구들까지 담은 배열이 되고, 아래 "$exit -ne 0"
+# 판정과 pipeline.status 의 exit= 값이 둘 다 망가진다.
+function Write-UploadNote([string]$text) {
+    Write-Host $text
+    Add-Content -Path $log -Value $text
+}
+
 function Invoke-Upload {
     # 산출물 순서: 매니페스트·summary(작음, 감사 먼저) -> augmentation zip -> 이미지/라벨.
-    "[upload] 1/3 매니페스트·summary·로그" | Tee-Object -FilePath $log -Append
+    # 패턴 앞의 / 는 전송 루트 기준을 뜻한다. 이게 없으면 rclone 은 모든 깊이에서
+    # 매칭하므로 --include "*.json" 이 CT/RGB 트리 안의 라벨·이력 JSON 44,000 개까지
+    # 끌어와 파일 단위로 올린다. 3/3 에서 트리를 묶는 의미가 사라진다.
+    Write-UploadNote "[upload] 1/3 매니페스트·summary·로그"
     & rclone copy $Output $Remote `
-        --include "manifests/**" --include "*.json" --include "logs/**" `
+        --include "/manifests/**" --include "/*.json" --include "/logs/**" `
         --transfers 8 --retries 5 --stats 30s --stats-one-line `
         --log-level INFO --log-file $log
     if ($LASTEXITCODE -ne 0) { return $LASTEXITCODE }
 
     $zips = Get-ChildItem $Output -Filter "*.zip" -ErrorAction SilentlyContinue
     if ($zips) {
-        "[upload] 2/3 augmentation zip: $($zips.Count)개" | Tee-Object -FilePath $log -Append
+        Write-UploadNote "[upload] 2/3 augmentation zip: $($zips.Count)개"
         foreach ($zip in $zips) {
             $gb = [math]::Round($zip.Length / 1GB, 3)
-            "[upload] 시작: $($zip.Name) ($gb GB)" | Tee-Object -FilePath $log -Append
+            Write-UploadNote "[upload] 시작: $($zip.Name) ($gb GB)"
             & rclone copyto $zip.FullName "$Remote/$($zip.Name)" --drive-chunk-size 128M --transfers 1 `
                 --retries 5 --low-level-retries 20 --stats 30s --stats-one-line `
                 --log-level INFO --log-file $log
@@ -162,16 +173,16 @@ function Invoke-Upload {
 
     $tree = @("CT", "RGB") | Where-Object { Test-Path (Join-Path $Output $_) }
     if (-not $tree) {
-        "[upload] 3/3 CT·RGB 트리 없음, 건너뜀" | Tee-Object -FilePath $log -Append
+        Write-UploadNote "[upload] 3/3 CT·RGB 트리 없음, 건너뜀"
         return 0
     }
 
     if ($RawTree) {
         # 개별 파일을 Drive 에서 그대로 열람해야 할 때만 쓴다. 아래 아카이브 경로보다
         # 수십 배 느리다.
-        "[upload] 3/3 이미지·라벨 트리 (CT·RGB, 파일 단위)" | Tee-Object -FilePath $log -Append
+        Write-UploadNote "[upload] 3/3 이미지·라벨 트리 (CT·RGB, 파일 단위)"
         & rclone copy $Output $Remote `
-            --include "CT/**" --include "RGB/**" `
+            --include "/CT/**" --include "/RGB/**" `
             --transfers 8 --retries 5 --low-level-retries 20 --stats 30s --stats-one-line `
             --log-level INFO --log-file $log
         return $LASTEXITCODE
@@ -181,18 +192,18 @@ function Invoke-Upload {
     # 파일 단위로 올리면 용량(1 GB 미만)과 무관하게 몇 시간이 걸린다. 트리를 zip 하나로
     # 묶어 큰 파일 한 개로 올리면 같은 데이터가 10 분대에 끝난다.
     $archive = Join-Path $pipeDir ((Split-Path $Output -Leaf) + "_images.zip")
-    "[upload] 3/3 이미지·라벨 아카이브 생성: $archive" | Tee-Object -FilePath $log -Append
+    Write-UploadNote "[upload] 3/3 이미지·라벨 아카이브 생성: $archive"
     if (Test-Path $archive) { Remove-Item $archive -Force }
     # bsdtar(Windows 기본 tar.exe). -a 로 확장자에서 zip 포맷을 고른다. JPG 는 이미
     # 압축돼 있어 줄지 않지만 JSON 라벨이 크게 줄고, 무엇보다 파일 수가 1 개가 된다.
     & tar.exe -a -c -f $archive -C $Output @tree
     if ($LASTEXITCODE -ne 0) {
-        "[upload] 아카이브 생성 실패 (exit=$LASTEXITCODE)" | Tee-Object -FilePath $log -Append
+        Write-UploadNote "[upload] 아카이브 생성 실패 (exit=$LASTEXITCODE)"
         return $LASTEXITCODE
     }
     $archiveItem = Get-Item $archive
     $gb = [math]::Round($archiveItem.Length / 1GB, 3)
-    "[upload] 아카이브 완료: $($archiveItem.Name) ($gb GB) -> 전송 시작" | Tee-Object -FilePath $log -Append
+    Write-UploadNote "[upload] 아카이브 완료: $($archiveItem.Name) ($gb GB) -> 전송 시작"
     & rclone copyto $archive "$Remote/$($archiveItem.Name)" --drive-chunk-size 128M --transfers 1 `
         --retries 5 --low-level-retries 20 --stats 30s --stats-one-line `
         --log-level INFO --log-file $log
