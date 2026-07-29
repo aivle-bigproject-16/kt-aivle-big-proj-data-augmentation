@@ -119,7 +119,7 @@ def _pcg64_shuffle(values: list[Any], seed: int) -> None:
 # scan 캐시 스키마 버전. _validate_pair 가 쓰는 검증 로직 — open_normalized, pixel_hash,
 # point_rings, extract_ct_roi, porosity_bbox_metric, 필수 필드 목록 — 이 바뀌면 반드시
 # 올린다. 올리지 않으면 낡은 판정을 그대로 재사용하게 된다.
-SCAN_CACHE_VERSION = "1"
+SCAN_CACHE_VERSION = "2"
 
 SCAN_CACHE_FIELDS = [
     "cache_version",
@@ -140,6 +140,7 @@ SCAN_CACHE_FIELDS = [
     "height",
     "porosity_bbox_max_ratio",
     "porosity_component_count",
+    "has_battery_outline",
     "roi",
     "exclusion_reason",
 ]
@@ -266,6 +267,7 @@ def _result_from_cache(
         tuple(json.loads(entry["roi"])) if entry["roi"] else None,
         ratio,
         int(entry["porosity_component_count"]),
+        entry["has_battery_outline"].casefold() == "true",
     )
     return (None if excluded else candidate), row, entry
 
@@ -370,6 +372,7 @@ def _validate_pair(
         "height": "",
         "porosity_bbox_max_ratio": "",
         "porosity_component_count": "",
+        "has_battery_outline": "",
         "roi": "",
         "exclusion_reason": "",
     }
@@ -391,6 +394,7 @@ def _validate_pair(
         if declared and Path(str(declared)).stem.casefold() != stem.casefold():
             raise ValueError(f"image_info.file_name stem mismatch: {declared}")
         outline = label.get("swelling", {}).get("battery_outline")
+        has_battery_outline = outline not in (None, [])
         if outline not in (None, []):
             point_rings(outline)
         defects = label.get("defects")
@@ -435,6 +439,7 @@ def _validate_pair(
             roi,
             ratio,
             component_count,
+            has_battery_outline,
         )
         # 캐시에는 제외 판정 이전의 사실만 담는다. excluded 는 ct_porosity_threshold 를
         # 다시 적용해 복원하므로, 임계값만 바뀐 경우 캐시가 그대로 유효하다.
@@ -448,6 +453,7 @@ def _validate_pair(
                 "height": image.height,
                 "porosity_bbox_max_ratio": f"{ratio:.8f}",
                 "porosity_component_count": component_count,
+                "has_battery_outline": str(has_battery_outline).lower(),
                 "roi": json.dumps(roi) if roi is not None else "",
             }
         )
@@ -922,11 +928,7 @@ def create_plan(
                     (
                         position
                         for position, candidate in enumerate(available)
-                        if bool(
-                            (candidate.label.get("swelling") or {}).get(
-                                "battery_outline"
-                            )
-                        )
+                        if candidate.has_battery_outline
                     ),
                     -1,
                 )

@@ -119,6 +119,55 @@ class ScanCacheTests(unittest.TestCase):
             second = create_plan(raw, config, root / "plan2", reuse_scan=root / "plan1")
             self.assertEqual(first["raw_fingerprint"], second["raw_fingerprint"])
 
+    def test_cache_preserves_battery_outline_eligibility(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "raw"
+            _write_raw(raw)
+            config = {
+                **_config(),
+                "rgb_failure_case_quotas": {
+                    "rgb_reflection_glare": 1,
+                    "rgb_surface_dust": 1,
+                },
+            }
+
+            create_plan(raw, config, root / "plan1")
+            cache = root / "plan1" / "manifests" / "scan_cache.csv"
+            first_rows = _cache_rows(cache)
+            rgb_rows = [
+                row for row in first_rows.values() if row["modality"] == "RGB"
+            ]
+            self.assertTrue(rgb_rows)
+            self.assertTrue(
+                all(row["has_battery_outline"] == "true" for row in rgb_rows)
+            )
+
+            create_plan(raw, config, root / "plan2", reuse_scan=cache)
+            second_rows = _cache_rows(
+                root / "plan2" / "manifests" / "scan_cache.csv"
+            )
+            with (
+                root / "plan2" / "manifests" / "generation_plan.csv"
+            ).open(encoding="utf-8-sig", newline="") as handle:
+                second_plan = list(csv.DictReader(handle))
+            self.assertTrue(
+                any(
+                    row["failure_case"] == "rgb_reflection_glare"
+                    for row in second_plan
+                )
+            )
+            self.assertEqual(
+                {
+                    stem: row["has_battery_outline"]
+                    for stem, row in first_rows.items()
+                },
+                {
+                    stem: row["has_battery_outline"]
+                    for stem, row in second_rows.items()
+                },
+            )
+
     def test_changed_source_is_revalidated_instead_of_trusted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

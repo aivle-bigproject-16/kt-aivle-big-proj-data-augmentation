@@ -50,3 +50,4 @@ class Candidate:
     roi: tuple[float, float, float, float] | None
     porosity_bbox_max_ratio: float = 0.0
     porosity_component_count: int = 0
+    has_battery_outline: bool = False
