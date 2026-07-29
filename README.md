@@ -37,7 +37,8 @@ ID, 파일명, 출력 크기, `quality_class`, 변환된 polygon 좌표를 갖�
        ↓        산출: 이미지·라벨·이력 전량, manifests/,
        ↓              generation_summary.json, augmentation_json_4k_v1.7.zip
 [5] verify      생성된 데이터셋 재검증
-[6] upload      원격 저장소로 전송
+[6] upload      Google Drive AIVLE_BigProject/data_augmentation 로 전송
+                (CT·RGB 트리는 zip 하나로 묶어서 보낸다)
 ```
 
 v1.7에는 사람 visual QA 게이트가 없다. `generate`가 자동 검증까지 통과하면
@@ -291,14 +292,35 @@ pwsh -File .\run_pipeline.ps1 -Stage resume `
   -Plan "E:\quality_fail_40k_plan_v1.7\manifests\generation_plan.csv" `
   -Output "E:\quality_fail_40k_v1.7" -Detached
 
-# 4) 원격(gdrive 등) 업로드
+# 4) Google Drive 업로드 (기본 목적지로)
 pwsh -File .\run_pipeline.ps1 -Stage upload `
-  -Output "E:\quality_fail_40k_v1.7" -Remote "gdrive:quality_fail_40k_v1.7" -Detached
+  -Output "E:\quality_fail_40k_v1.7" -Detached
 ```
 
 v1.7의 `generate`는 사람 QA 대기 없이 자동 검증과 최종 산출물 생성을 완료한다.
-`upload`는 `rclone`이 설치되고 원격이 설정돼 있어야 하며,
-매니페스트와 summary를 먼저 올린 뒤 augmentation ZIP과 이미지·라벨 트리를 올린다.
+
+### 업로드 목적지와 방식
+
+산출물은 모두 Google Drive의 `AIVLE_BigProject/data_augmentation` 아래에 보관한다.
+`-Remote`를 생략하면 `gdrive:AIVLE_BigProject/data_augmentation/<Output 폴더명>`으로
+올라가므로, 실행마다 목적지를 따로 지정할 필요가 없다. 다른 곳에 올려야 할 때만
+`-Remote`로 덮어쓴다. `rclone`이 설치되고 `gdrive` 원격이 설정돼 있어야 한다.
+
+업로드는 세 부분으로 나뉜다.
+
+| 순서 | 대상 | 형태 |
+|---|---|---|
+| 1 | `manifests/`, `generation_summary.json`, `logs/` | 파일 그대로 (작고 감사용이라 바로 열람 가능해야 한다) |
+| 2 | `augmentation_json_4k_v1.7.zip` | 파일 그대로 |
+| 3 | `CT/`, `RGB/` 트리 | **`<Output 폴더명>_images.zip` 하나로 묶어서** |
+
+3번을 묶는 이유는 용량이 아니라 개수다. 40,000장과 라벨을 합치면 약 84,000개인데,
+Google Drive는 파일마다 API 왕복이 필요해 1 GB도 안 되는 데이터를 파일 단위로 올리면
+몇 시간이 걸린다. zip 하나로 묶으면 같은 데이터가 10분대에 끝난다. 아카이브는 데이터
+output이 아니라 `<Output>-pipeline\` 아래에 만들어지므로 output 트리를 오염시키지 않는다.
+
+Drive에서 개별 이미지를 직접 열어봐야 하는 경우에만 `-RawTree`로 예전 방식(파일 단위
+업로드)을 쓴다.
 
 `generate`, `smoke`, `resume`은 시작할 때마다 plan 검증을 위해 전체 raw를 다시 스캔한다
 (약 44분). plan 직후처럼 원본이 그대로임이 확실하면 `-TrustPlan`(툴의 `--trust-plan`)을

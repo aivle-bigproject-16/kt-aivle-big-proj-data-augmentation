@@ -14,7 +14,10 @@
       generate 확정된 plan 으로 전체 생성하고 자동 검증 후 최종 ZIP 과 summary 를 만든다.
       resume   중단된 generate 작업을 기존 output 에서 이어서 실행한다.
       verify   생성된 데이터셋을 재검증한다.
-      upload   생성 산출물을 rclone 으로 원격(gdrive 등)에 올린다.
+      upload   생성 산출물을 rclone 으로 원격(gdrive 등)에 올린다. CT·RGB 트리는 zip
+               하나로 묶어서 보낸다. -Remote 를 생략하면 기본 목적지
+               gdrive:AIVLE_BigProject/data_augmentation/<Output 폴더명> 을 쓴다.
+               -RawTree 를 주면 예전처럼 파일 단위로 올린다(수십 배 느리다).
 
   v1.7에는 사람 visual QA 게이트가 없다. generate 가 자동 검증까지 통과하면 최종
   산출물을 바로 만들며, resume 은 중단 복구에만 사용한다.
@@ -40,7 +43,7 @@
       pwsh -File .\run_pipeline.ps1 -Stage generate -RawRoot "..." -Config .\config.measured.json -Plan "D:\qf_plan\manifests\generation_plan.csv" -Output "D:\qf_full" -Detached
       pwsh -File .\run_pipeline.ps1 -Stage resume   -RawRoot "..." -Config .\config.measured.json -Plan "D:\qf_plan\manifests\generation_plan.csv" -Output "D:\qf_full" -Detached
       pwsh -File .\run_pipeline.ps1 -Stage verify   -Output "D:\qf_full"
-      pwsh -File .\run_pipeline.ps1 -Stage upload   -Output "D:\qf_full" -Remote "gdrive:quality_fail_40k_v1.7" -Detached
+      pwsh -File .\run_pipeline.ps1 -Stage upload   -Output "D:\qf_full" -Detached
 
   계획 재작성이 필요할 때(quota·seed 등 계획에 영향을 주는 config 변경):
 
@@ -59,9 +62,13 @@ param(
     [string]$DropCases,
     [string]$ReuseScan,
     [switch]$TrustPlan,
+    [switch]$RawTree,
     [switch]$KeepDisplay,
     [switch]$Detached
 )
+
+# upload 기본 목적지. -Remote 를 생략하면 이 아래에 <Output 폴더명> 으로 올린다.
+$DefaultRemoteRoot = "gdrive:AIVLE_BigProject/data_augmentation"
 
 $ErrorActionPreference = "Stop"
 
@@ -77,6 +84,7 @@ if ($Detached) {
     }
     $forward += @("-LimitPerModality", "$LimitPerModality")
     if ($TrustPlan) { $forward += "-TrustPlan" }
+    if ($RawTree) { $forward += "-RawTree" }
     if ($KeepDisplay) { $forward += "-KeepDisplay" }
     $child = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $forward -WindowStyle Hidden -PassThru
     Write-Host "$Stage 를 분리 실행으로 시작했다. PID $($child.Id)" -ForegroundColor Cyan
@@ -131,7 +139,7 @@ print(f'measured worker_peak_rss_bytes={rss} -> {sys.argv[3]}')
 }
 
 function Invoke-Upload {
-    # 산출물 순서: 매니페스트·summary(작음, 감사 먼저) -> augmentation zip -> 이미지/라벨 트리.
+    # 산출물 순서: 매니페스트·summary(작음, 감사 먼저) -> augmentation zip -> 이미지/라벨.
     "[upload] 1/3 매니페스트·summary·로그" | Tee-Object -FilePath $log -Append
     & rclone copy $Output $Remote `
         --include "manifests/**" --include "*.json" --include "logs/**" `
@@ -152,10 +160,41 @@ function Invoke-Upload {
         }
     }
 
-    "[upload] 3/3 이미지·라벨 트리 (CT·RGB)" | Tee-Object -FilePath $log -Append
-    & rclone copy $Output $Remote `
-        --include "CT/**" --include "RGB/**" `
-        --transfers 8 --retries 5 --low-level-retries 20 --stats 30s --stats-one-line `
+    $tree = @("CT", "RGB") | Where-Object { Test-Path (Join-Path $Output $_) }
+    if (-not $tree) {
+        "[upload] 3/3 CT·RGB 트리 없음, 건너뜀" | Tee-Object -FilePath $log -Append
+        return 0
+    }
+
+    if ($RawTree) {
+        # 개별 파일을 Drive 에서 그대로 열람해야 할 때만 쓴다. 아래 아카이브 경로보다
+        # 수십 배 느리다.
+        "[upload] 3/3 이미지·라벨 트리 (CT·RGB, 파일 단위)" | Tee-Object -FilePath $log -Append
+        & rclone copy $Output $Remote `
+            --include "CT/**" --include "RGB/**" `
+            --transfers 8 --retries 5 --low-level-retries 20 --stats 30s --stats-one-line `
+            --log-level INFO --log-file $log
+        return $LASTEXITCODE
+    }
+
+    # Google Drive 는 파일마다 API 왕복이 필요하다. 40,000 장 + 라벨 = 약 84,000 개를
+    # 파일 단위로 올리면 용량(1 GB 미만)과 무관하게 몇 시간이 걸린다. 트리를 zip 하나로
+    # 묶어 큰 파일 한 개로 올리면 같은 데이터가 10 분대에 끝난다.
+    $archive = Join-Path $pipeDir ((Split-Path $Output -Leaf) + "_images.zip")
+    "[upload] 3/3 이미지·라벨 아카이브 생성: $archive" | Tee-Object -FilePath $log -Append
+    if (Test-Path $archive) { Remove-Item $archive -Force }
+    # bsdtar(Windows 기본 tar.exe). -a 로 확장자에서 zip 포맷을 고른다. JPG 는 이미
+    # 압축돼 있어 줄지 않지만 JSON 라벨이 크게 줄고, 무엇보다 파일 수가 1 개가 된다.
+    & tar.exe -a -c -f $archive -C $Output @tree
+    if ($LASTEXITCODE -ne 0) {
+        "[upload] 아카이브 생성 실패 (exit=$LASTEXITCODE)" | Tee-Object -FilePath $log -Append
+        return $LASTEXITCODE
+    }
+    $archiveItem = Get-Item $archive
+    $gb = [math]::Round($archiveItem.Length / 1GB, 3)
+    "[upload] 아카이브 완료: $($archiveItem.Name) ($gb GB) -> 전송 시작" | Tee-Object -FilePath $log -Append
+    & rclone copyto $archive "$Remote/$($archiveItem.Name)" --drive-chunk-size 128M --transfers 1 `
+        --retries 5 --low-level-retries 20 --stats 30s --stats-one-line `
         --log-level INFO --log-file $log
     return $LASTEXITCODE
 }
@@ -189,7 +228,10 @@ switch ($Stage) {
         $cliArgs = @("verify", "--output", $Output)
     }
     "upload" {
-        if (-not $Remote) { Write-Error "-Remote 필요"; exit 2 }
+        if (-not $Remote) {
+            $Remote = "$DefaultRemoteRoot/$(Split-Path $Output -Leaf)"
+            "[run_pipeline] -Remote 생략, 기본 목적지 사용: $Remote" | Tee-Object -FilePath $log -Append
+        }
         $cliArgs = $null
     }
 }

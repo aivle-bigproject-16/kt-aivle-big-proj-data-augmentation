@@ -779,12 +779,19 @@ def _fingerprint(candidates: list[Candidate], raw_root: Path) -> str:
     return digest.hexdigest()
 
 
+# augment._ct_case draws its dense-region threshold from the top 0.3%..1.0% of the
+# histogram. Screening sources at the top 1% only guaranteed the easiest of those draws,
+# so a source could be admitted here and still fail with dense_region_mask_too_small when
+# the augmentation happened to pick 0.3%. Screen at the strictest end instead.
+DENSE_ANCHOR_TOP_RATIO = 0.003
+
+
 def _has_dense_ct_anchor(candidate: Candidate) -> bool:
     image = open_normalized(candidate.image_path, "CT")
     if candidate.roi is not None:
         image = image.crop(tuple(int(round(value)) for value in candidate.roi))
     array = np.asarray(image.convert("L"), dtype=np.float32)
-    threshold = float(np.quantile(array, 0.99))
+    threshold = float(np.quantile(array, 1.0 - DENSE_ANCHOR_TOP_RATIO))
     component = _largest_connected_component(array >= threshold)
     return float(component.mean()) >= 0.001
 
