@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import random
 from dataclasses import dataclass
 from typing import Any
 
@@ -46,6 +45,31 @@ CASE_NAMES_KO = {
 SOURCE_REFERENCES = {case: f"v1.7:{case}" for case in (*CT_CASES, *RGB_CASES)}
 
 
+class _PCG64Random:
+    """Small compatibility facade backed exclusively by NumPy PCG64."""
+
+    def __init__(self, generator: np.random.Generator):
+        self.generator = generator
+
+    def random(self) -> float:
+        return float(self.generator.random())
+
+    def uniform(self, low: float, high: float) -> float:
+        return float(self.generator.uniform(low, high))
+
+    def randint(self, low: int, high: int) -> int:
+        return int(self.generator.integers(low, high + 1))
+
+    def randrange(self, start: int, stop: int, step: int = 1) -> int:
+        values = np.arange(start, stop, step)
+        if not len(values):
+            raise ValueError("empty randrange")
+        return int(values[int(self.generator.integers(0, len(values)))])
+
+    def choice(self, values: Any) -> Any:
+        return values[int(self.generator.integers(0, len(values)))]
+
+
 @dataclass
 class AugmentResult:
     image: Image.Image
@@ -67,9 +91,15 @@ def _record(order: int, name: str, severity: float, **parameters: Any) -> dict[s
 def background(image: Image.Image, modality: str) -> tuple[int, ...] | int:
     array = np.asarray(image)
     if modality == "CT":
-        if array.ndim == 2:
-            return int(np.quantile(array, 0.2))
-        return tuple(int(np.quantile(array[..., c], 0.2)) for c in range(array.shape[2]))
+        channels = [array] if array.ndim == 2 else [array[..., c] for c in range(array.shape[2])]
+        values: list[int] = []
+        for channel in channels:
+            border = np.concatenate(
+                (channel[0], channel[-1], channel[:, 0], channel[:, -1])
+            )
+            air = border[border <= np.quantile(border, 0.20)]
+            values.append(int(np.median(air if air.size else border)))
+        return values[0] if array.ndim == 2 else tuple(values)
     rgb = np.asarray(image.convert("RGB"))
     border = np.concatenate((rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]), axis=0)
     return tuple(int(value) for value in np.median(border, axis=0))
@@ -111,6 +141,41 @@ def _motion_blur(image: Image.Image, kernel: int, angle: float) -> Image.Image:
 def _translate(image: Image.Image, dx: int, dy: int, fill: Any) -> Image.Image:
     output = Image.new(image.mode, image.size, fill)
     output.paste(image, (dx, dy))
+    return output
+
+
+def _largest_connected_component(mask: np.ndarray) -> np.ndarray:
+    """Return the largest 8-connected component without adding a SciPy dependency."""
+    source = mask.astype(bool)
+    seen = np.zeros(source.shape, dtype=bool)
+    best: list[tuple[int, int]] = []
+    height, width = source.shape
+    for start_y, start_x in zip(*np.where(source & ~seen)):
+        if seen[start_y, start_x]:
+            continue
+        stack = [(int(start_y), int(start_x))]
+        seen[start_y, start_x] = True
+        component: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            component.append((y, x))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = y + dy, x + dx
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and source[ny, nx]
+                        and not seen[ny, nx]
+                    ):
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(component) > len(best):
+            best = component
+    output = np.zeros(source.shape, dtype=bool)
+    if best:
+        ys, xs = zip(*best)
+        output[np.asarray(ys), np.asarray(xs)] = True
     return output
 
 
@@ -156,7 +221,7 @@ def _linear_to_srgb(array: np.ndarray) -> np.ndarray:
 
 def _signed_lines(
     image: Image.Image,
-    rng: random.Random,
+    rng: _PCG64Random,
     count: int,
     width_range: tuple[int, int],
     delta_range: tuple[int, int],
@@ -192,11 +257,13 @@ def _signed_lines(
 def _ct_case(
     image: Image.Image,
     case: str,
-    rng: random.Random,
+    rng: _PCG64Random,
     np_rng: np.random.Generator,
     severity: float,
     object_mask: Image.Image | None,
     defect_mask: Image.Image | None,
+    group_rng: _PCG64Random | None = None,
+    case_options: dict[str, Any] | None = None,
 ) -> tuple[Image.Image, Affine, list[dict[str, Any]], Image.Image | None]:
     result, transform, records = image.copy(), Affine(), []
     mask = object_mask.copy() if object_mask is not None else None
@@ -218,13 +285,11 @@ def _ct_case(
             "top": -(bottom + 1),
             "bottom": result.height - top + 1,
         }
-        minimum = min(abs(value) for value in candidates.values())
-        directions = [
-            direction
-            for direction, value in candidates.items()
-            if abs(value) <= minimum * 1.20
-        ]
-        direction = rng.choice(directions)
+        direction = (
+            (group_rng or rng).choice(("left", "right", "top", "bottom"))
+            if group_rng is not None
+            else min(candidates, key=lambda name: (abs(candidates[name]), name))
+        )
         dx = candidates[direction] if direction in {"left", "right"} else 0
         dy = candidates[direction] if direction in {"top", "bottom"} else 0
         fill = background(result, "CT")
@@ -240,19 +305,30 @@ def _ct_case(
                 direction=direction,
                 dx_px=dx,
                 dy_px=dy,
+                offset_source_space=[dx, dy],
                 background_value=fill,
                 target_bbox=list(target_bbox),
+                target_defect_ids=list((case_options or {}).get("target_defect_ids", [])),
+                removed_defect_ids=list((case_options or {}).get("target_defect_ids", [])),
+                retained_outline_ratio=(
+                    float((np.asarray(mask) > 0).sum())
+                    / max(float((np.asarray(object_mask) > 0).sum()), 1.0)
+                    if mask is not None and object_mask is not None
+                    else None
+                ),
                 output_frame=[0, 0, result.width, result.height],
             )
         )
     elif case == "ct_acquisition_motion":
-        angle = rng.uniform(0, 359)
+        direction_rng = group_rng or rng
+        angle = direction_rng.uniform(0, 359)
         normalized_offset = rng.uniform(18.0, 28.0)
         scale = max(result.size) / 512.0
         offset = max(1, round(normalized_offset * scale))
         dx = round(math.cos(math.radians(angle)) * offset)
         dy = round(math.sin(math.radians(angle)) * offset)
-        kernel = max(5, (round(rng.uniform(7, 15) * scale) | 1))
+        blur_half_range = rng.uniform(2.0, 5.0)
+        kernel = max(9, (round((blur_half_range * 2 + 1) * scale) | 1))
         blurred = _motion_blur(result, kernel, angle)
         shifted = _translate(result, dx, dy, background(result, "CT"))
         shifted_weight = rng.uniform(0.45, 0.52)
@@ -264,6 +340,7 @@ def _ct_case(
                 severity,
                 kernel=kernel,
                 angle_deg=angle,
+                displacement_range_final_512_px=blur_half_range,
             )
         )
         records.append(
@@ -293,6 +370,16 @@ def _ct_case(
         sigma = rng.uniform(1.275, 6.375)
         result = _noise(result, np_rng, sigma, monochrome=True)
         records.append(_record(3, "read_noise", severity, sigma=sigma))
+        contrast_factor = rng.uniform(0.45, 0.80)
+        result = ImageEnhance.Contrast(result).enhance(contrast_factor)
+        records.append(
+            _record(
+                4,
+                "low_contrast_attenuation",
+                severity,
+                contrast_factor=contrast_factor,
+            )
+        )
     elif case == "ct_insufficient_projection_sampling":
         # Sparse-view Radon reconstruction: build a sinogram from rotated projections, apply a
         # ramp filter, then back-project only the retained angles. This creates reconstruction
@@ -375,9 +462,10 @@ def _ct_case(
             )
         )
     elif case == "ct_beam_hardening_metal_streak":
-        array = np.asarray(result.convert("L"))
-        threshold = float(np.quantile(array, rng.uniform(0.92, 0.98)))
-        dense_region_mask = array >= threshold
+        array = np.asarray(result.convert("L"), dtype=np.float32)
+        top_ratio = rng.uniform(0.003, 0.010)
+        threshold = float(np.quantile(array, 1.0 - top_ratio))
+        dense_region_mask = _largest_connected_component(array >= threshold)
         if float(dense_region_mask.mean()) < 0.001:
             raise ValueError("dense_region_mask_too_small")
         attenuation = rng.uniform(0.20, 0.70)
@@ -387,14 +475,20 @@ def _ct_case(
         records.append(_record(1, "dense_material_mask", severity, threshold=threshold, area_ratio=float(dense_region_mask.mean()), attenuation=attenuation))
         yy, xx = np.mgrid[0 : result.height, 0 : result.width]
         dense_y, dense_x = np.where(dense_region_mask)
-        center_x, center_y = float(dense_x.mean()), float(dense_y.mean())
+        dense_weights = np.maximum(array[dense_region_mask] - threshold + 1.0, 1.0)
+        center_x = float(np.average(dense_x, weights=dense_weights))
+        center_y = float(np.average(dense_y, weights=dense_weights))
         object_bbox = object_mask.getbbox() if object_mask is not None else None
         if object_bbox is None:
             object_bbox = (0, 0, result.width, result.height)
         object_width = max(1.0, object_bbox[2] - object_bbox[0])
         object_height = max(1.0, object_bbox[3] - object_bbox[1])
-        radius_x = object_width * rng.uniform(0.35, 0.65)
-        radius_y = object_height * rng.uniform(0.35, 0.65)
+        if object_width <= object_height:
+            radius_x = object_width * rng.uniform(0.35, 0.70)
+            radius_y = object_height * rng.uniform(0.12, 0.30)
+        else:
+            radius_x = object_width * rng.uniform(0.12, 0.30)
+            radius_y = object_height * rng.uniform(0.35, 0.70)
         elliptical = np.sqrt(
             ((xx - center_x) / radius_x) ** 2
             + ((yy - center_y) / radius_y) ** 2
@@ -402,15 +496,26 @@ def _ct_case(
         asymmetry = 1.0 + rng.uniform(-0.35, 0.35) * np.clip(
             (xx - center_x) / radius_x, -1.0, 1.0
         )
-        cupping = -rng.uniform(8, 30) * np.clip(1.0 - elliptical, 0.0, 1.0) * asymmetry
+        cupping_delta = (
+            rng.uniform(35.0, 80.0)
+            if rng.random() < 0.5
+            else rng.uniform(-25.0, -10.0)
+        )
+        cupping_profile = np.clip(1.0 - elliptical, 0.0, 1.0)
+        feather_ratio = rng.uniform(0.08, 0.18)
+        feather_t = np.clip(cupping_profile / feather_ratio, 0.0, 1.0)
+        feathered_edge = feather_ratio * feather_t**2 * (3.0 - 2.0 * feather_t)
+        cupping_profile = np.where(
+            cupping_profile < feather_ratio, feathered_edge, cupping_profile
+        )
+        cupping = cupping_delta * cupping_profile * asymmetry
         result = _luminance_field(result, cupping.astype(np.float32))
-        records.append(_record(2, "cupping_field", severity, center=[center_x, center_y], radii=[radius_x, radius_y], asymmetric=True))
+        records.append(_record(2, "cupping_field", severity, center=[center_x, center_y], radii=[radius_x, radius_y], asymmetric=True, feather_ratio=feather_ratio))
         count = rng.randint(24, 72)
         field = Image.new("F", result.size, 0.0)
         draw = ImageDraw.Draw(field)
         diagonal = math.hypot(result.width, result.height)
-        selected = rng.randrange(len(dense_x))
-        cx, cy = int(dense_x[selected]), int(dense_y[selected])
+        cx, cy = int(round(center_x)), int(round(center_y))
         start_angle = rng.uniform(0, 360)
         jitter_limit = min(3.0, 120.0 / count)
         angles: list[float] = []
@@ -421,7 +526,11 @@ def _ct_case(
                 + rng.uniform(-jitter_limit, jitter_limit)
             ) % 360.0
             angle = math.radians(angle_deg)
-            delta = rng.choice((-1, 1)) * rng.uniform(12, 48)
+            normalized_width = rng.uniform(1.0, 4.0)
+            source_scale = max(result.size) / 512.0
+            width = max(1, round(normalized_width * source_scale))
+            alpha = rng.uniform(0.10, 0.35)
+            delta = rng.choice((-1, 1)) * alpha * 255.0
             draw.line(
                 (
                     cx,
@@ -430,16 +539,36 @@ def _ct_case(
                     cy + math.sin(angle) * diagonal,
                 ),
                 fill=float(delta),
-                width=rng.randint(1, 3),
+                width=width,
             )
             angles.append(angle_deg)
         streak_field = np.asarray(field).copy()
         distance = np.hypot(xx - cx, yy - cy)
-        decay_scale = max(result.size) * rng.uniform(0.45, 0.80)
+        decay_scale = max(result.size) * rng.uniform(0.35, 0.70)
         streak_field *= np.exp(-distance / max(decay_scale, 1.0))
         if object_mask is not None:
             object_array = np.asarray(object_mask.convert("L")) > 0
-            air_factor = np.where(object_array, 1.0, 0.08)
+            bbox = object_mask.getbbox() or (0, 0, result.width, result.height)
+            outside_dx = np.maximum.reduce(
+                [
+                    np.asarray(bbox[0] - xx, dtype=np.float32),
+                    np.asarray(xx - (bbox[2] - 1), dtype=np.float32),
+                    np.zeros(xx.shape, dtype=np.float32),
+                ]
+            )
+            outside_dy = np.maximum.reduce(
+                [
+                    np.asarray(bbox[1] - yy, dtype=np.float32),
+                    np.asarray(yy - (bbox[3] - 1), dtype=np.float32),
+                    np.zeros(yy.shape, dtype=np.float32),
+                ]
+            )
+            outside_distance = np.hypot(outside_dx, outside_dy)
+            fade_distance = max(result.size) * rng.uniform(0.10, 0.25)
+            air_fade = 0.08 * np.clip(
+                1.0 - outside_distance / max(fade_distance, 1.0), 0.0, 1.0
+            )
+            air_factor = np.where(object_array, 1.0, air_fade)
             streak_field *= air_factor
         streak_mask = streak_field != 0
         dense_intersections = int((streak_mask & dense_region_mask).sum())
@@ -475,63 +604,89 @@ def _ct_case(
 def _rgb_case(
     image: Image.Image,
     case: str,
-    rng: random.Random,
+    rng: _PCG64Random,
     np_rng: np.random.Generator,
     severity: float,
     object_mask: Image.Image | None,
     defect_mask: Image.Image | None,
+    case_options: dict[str, Any] | None = None,
 ) -> tuple[Image.Image, Affine, list[dict[str, Any]], Image.Image | None]:
     result, transform, records = image.copy(), Affine(), []
     mask = object_mask.copy() if object_mask is not None else None
+    case_options = case_options or {}
     if case == "rgb_trigger_timing_failure":
-        side = rng.choice(("left", "right", "top", "bottom"))
+        conveyor_axis = str(case_options.get("conveyor_axis", "horizontal")).casefold()
+        if conveyor_axis not in {"horizontal", "vertical"}:
+            raise ValueError("conveyor_axis must be horizontal or vertical")
+        forward_direction = str(
+            case_options.get("forward_direction", "positive")
+        ).casefold()
+        if forward_direction not in {"positive", "negative"}:
+            raise ValueError("forward_direction must be positive or negative")
+        timing_event = rng.choice(("early", "late"))
+        negative_side, positive_side = (
+            ("left", "right")
+            if conveyor_axis == "horizontal"
+            else ("top", "bottom")
+        )
+        leading_side, trailing_side = (
+            (positive_side, negative_side)
+            if forward_direction == "positive"
+            else (negative_side, positive_side)
+        )
+        side = leading_side if timing_event == "early" else trailing_side
         # The crop has to clip the battery, not merely trim background. Sizing the cut against
         # the frame let a centred cylindrical cell survive intact - it covers about 11% of the
         # frame width, so a left/right cut of 10..38% often removed only white background and
         # the result was indistinguishable from a normal photo (7 of 30 visual QA samples were
         # rejected for this). Put the cut plane inside the outline bounding box instead, so it
         # always removes 15%..45% of the box along the chosen axis.
-        bbox = mask.getbbox() if mask is not None else None
         axis_size = result.width if side in {"left", "right"} else result.height
-        if bbox is not None:
-            left, top, right, bottom = bbox
-            bite = rng.uniform(0.15, 0.45)
-            if side == "left":
-                amount = left + bite * (right - left)
-            elif side == "right":
-                amount = (result.width - right) + bite * (right - left)
-            elif side == "top":
-                amount = top + bite * (bottom - top)
-            else:
-                amount = (result.height - bottom) + bite * (bottom - top)
-        else:
-            amount = axis_size * rng.uniform(0.10, 0.38)
-        amount = min(max(1, round(amount)), axis_size - 1)
-        crop = [0, 0, result.width, result.height]
-        if side == "left":
-            crop[0] += amount
-        elif side == "right":
-            crop[2] -= amount
-        elif side == "top":
-            crop[1] += amount
-        else:
-            crop[3] -= amount
-        # Keep the source aspect ratio.  The timing error still cuts through the
-        # battery on the selected edge, while the perpendicular axis is cropped
-        # symmetrically so the common resize stage does not distort the frame.
         aspect = result.width / result.height
-        current_width = crop[2] - crop[0]
-        current_height = crop[3] - crop[1]
-        if side in {"left", "right"}:
-            target_height = min(current_height, max(1, round(current_width / aspect)))
-            trim = current_height - target_height
-            crop[1] += trim // 2
-            crop[3] -= trim - trim // 2
+        def crop_for(amount: int) -> list[int]:
+            candidate = [0, 0, result.width, result.height]
+            if side == "left":
+                candidate[0] += amount
+            elif side == "right":
+                candidate[2] -= amount
+            elif side == "top":
+                candidate[1] += amount
+            else:
+                candidate[3] -= amount
+            current_width = candidate[2] - candidate[0]
+            current_height = candidate[3] - candidate[1]
+            if side in {"left", "right"}:
+                target_height = min(current_height, max(1, round(current_width / aspect)))
+                trim = current_height - target_height
+                candidate[1] += trim // 2
+                candidate[3] -= trim - trim // 2
+            else:
+                target_width = min(current_width, max(1, round(current_height * aspect)))
+                trim = current_width - target_width
+                candidate[0] += trim // 2
+                candidate[2] -= trim - trim // 2
+            return candidate
+
+        target_retained_ratio = rng.uniform(0.55, 0.85)
+        if mask is not None and mask.getbbox() is not None:
+            original_area = max(int((np.asarray(mask) > 0).sum()), 1)
+            low_amount, high_amount = 1, axis_size - 1
+            crop = crop_for(low_amount)
+            for _ in range(18):
+                amount = (low_amount + high_amount) // 2
+                candidate = crop_for(amount)
+                retained = int(
+                    (np.asarray(mask.crop(tuple(candidate))) > 0).sum()
+                ) / original_area
+                crop = candidate
+                if retained > target_retained_ratio:
+                    low_amount = min(amount + 1, high_amount)
+                else:
+                    high_amount = max(amount - 1, low_amount)
         else:
-            target_width = min(current_width, max(1, round(current_height * aspect)))
-            trim = current_width - target_width
-            crop[0] += trim // 2
-            crop[2] -= trim - trim // 2
+            crop = crop_for(
+                min(max(1, round(axis_size * rng.uniform(0.10, 0.38))), axis_size - 1)
+            )
         result = result.crop(tuple(crop))
         if mask is not None:
             mask = mask.crop(tuple(crop))
@@ -545,6 +700,14 @@ def _rgb_case(
                 crop_box=crop,
                 source_aspect_ratio=aspect,
                 output_aspect_ratio=result.width / result.height,
+                target_outline_retained_ratio=(
+                    target_retained_ratio
+                    if object_mask is not None and object_mask.getbbox() is not None
+                    else None
+                ),
+                conveyor_axis=conveyor_axis,
+                forward_direction=forward_direction,
+                timing_event=timing_event,
             )
         )
         if rng.random() < 0.35:
@@ -577,6 +740,27 @@ def _rgb_case(
         array = np.asarray(result).astype(np.float32) * gain[..., None]
         result = _array_image(array, "RGB")
         records.append(_record(1, "lighting_gradient", severity, angle_deg=angle_deg, dark_gain=dark, bright_gain=bright, transition="smoothstep"))
+        if mask is not None and mask.getbbox() is not None and rng.random() < 0.50:
+            zone_count = rng.randint(1, 3)
+            zone_field = np.ones((result.height, result.width), dtype=np.float32)
+            points = _mask_points(mask)
+            object_area = max(int((np.asarray(mask) > 0).sum()), 1)
+            zones = []
+            for _ in range(zone_count):
+                cx, cy = rng.choice(points)
+                target_area = object_area * rng.uniform(0.04, 0.18)
+                radius = math.sqrt(target_area / math.pi)
+                zone_gain = rng.uniform(0.20, 0.65)
+                distance2 = (xx - cx) ** 2 + (yy - cy) ** 2
+                gaussian = np.exp(-distance2 / max(2.0 * radius**2, 1.0))
+                zone_field *= 1.0 - (1.0 - zone_gain) * gaussian
+                zones.append([cx, cy, radius, zone_gain])
+            result = _array_image(
+                np.asarray(result, dtype=np.float32) * zone_field[..., None], "RGB"
+            )
+            records.append(
+                _record(2, "led_dead_zone", severity, zone_count=zone_count, zones=zones)
+            )
     elif case == "rgb_reflection_glare":
         count = rng.randint(1, 2)
         overlay = Image.new("RGBA", result.size, (0, 0, 0, 0))
@@ -614,7 +798,9 @@ def _rgb_case(
             major_axis = np.array([0.0, 1.0])
             major_extent = result.height * 0.6
             highlight_points = []
-        for _ in range(count):
+        defect_points = _mask_points(defect_mask)
+        defect_bbox = defect_mask.getbbox() if defect_mask is not None else None
+        for patch_index in range(count):
             # Elongate the highlight along the object's principal form instead of emitting a
             # round white blob. The wide Gaussian falloff below removes the hard ellipse edge.
             if half_h >= half_w:
@@ -624,7 +810,9 @@ def _rgb_case(
                 rx = rng.randint(max(3, int(half_w * 0.32)), max(4, int(half_w * 0.70)))
                 ry = rng.randint(max(2, int(half_h * 0.08)), max(3, int(half_h * 0.20)))
             base = (
-                rng.choice(highlight_points)
+                rng.choice(defect_points)
+                if patch_index == 0 and defect_points
+                else rng.choice(highlight_points)
                 if highlight_points
                 else rng.choice(eligible)
                 if eligible
@@ -632,7 +820,7 @@ def _rgb_case(
             )
             cx = int(round(base[0] * 0.4 + centroid_x * 0.6))
             cy = int(round(base[1] * 0.4 + centroid_y * 0.6))
-            alpha = round(255 * rng.uniform(0.25, 0.62))
+            alpha = round(255 * rng.uniform(0.45, 0.75))
             half_length = major_extent * rng.uniform(0.22, 0.46)
             start = (
                 cx - major_axis[0] * half_length,
@@ -643,6 +831,11 @@ def _rgb_case(
                 cy + major_axis[1] * half_length,
             )
             width = max(2, round(min(rx, ry) * 1.4))
+            if patch_index == 0 and defect_bbox is not None:
+                width = max(
+                    width,
+                    round(min(defect_bbox[2] - defect_bbox[0], defect_bbox[3] - defect_bbox[1]) * 0.35),
+                )
             draw.line((start, end), fill=(255, 246, 224, alpha), width=width)
             patches.append({"center": [cx, cy], "axis": major_axis.tolist(), "half_length": half_length, "width": width, "alpha": alpha / 255})
         radius = rng.uniform(5, 14)
@@ -671,7 +864,7 @@ def _rgb_case(
             ((np.asarray(result.convert("L")) >= 250) & object_array).sum()
             / max(object_array.sum(), 1)
         )
-        records.append(_record(1, "surface_aware_specular_reflection", severity, seed="existing_highlight" if highlight_points else "outline_axis", patches=patches, bloom_radius_final_space=radius, outline_overlap_ratio=outline_overlap, core_object_area_ratio=core_object_ratio, defect_coverage_ratio=defect_coverage, object_saturation_ratio=saturation_ratio))
+        records.append(_record(1, "surface_aware_specular_reflection", severity, seed="defect" if defect_points else "existing_highlight" if highlight_points else "outline_axis", patches=patches, bloom_radius_final_space=radius, outline_overlap_ratio=outline_overlap, core_object_area_ratio=core_object_ratio, defect_present=bool(defect_points), defect_coverage_ratio=defect_coverage, object_saturation_ratio=saturation_ratio))
         records.append(_record(2, "highlight_bloom", severity, radius_final_space=radius))
     elif case == "rgb_focus_failure":
         radius = rng.uniform(2.5, 10)
@@ -726,13 +919,19 @@ def _rgb_case(
             )
         )
     elif case == "rgb_overexposure":
-        factor, gamma = rng.uniform(1.45, 2.60), rng.uniform(0.45, 0.85)
-        result = _gamma(ImageEnhance.Brightness(result).enhance(factor), gamma)
+        factor = rng.uniform(1.45, 2.60)
+        linear = _srgb_to_linear(np.asarray(result.convert("RGB")))
+        result = Image.fromarray(_linear_to_srgb(np.clip(linear * factor, 0.0, 1.0)), mode="RGB")
         threshold = rng.randint(185, 245)
         array = np.asarray(result)
         array = np.where(array >= threshold, 255, array)
         result = _array_image(array, "RGB")
-        records.append(_record(1, "overexposure", severity, brightness_factor=factor, gamma=gamma, clip_threshold=threshold))
+        records.append(_record(1, "overexposure", severity, exposure_factor=factor, color_space="linear_light", clip_threshold=threshold))
+        if rng.random() < 0.50:
+            radius = rng.uniform(3.0, 18.0) * max(result.size) / 512.0
+            bright = result.filter(ImageFilter.GaussianBlur(radius))
+            result = Image.blend(result, bright, 0.20)
+            records.append(_record(2, "highlight_bloom", severity, radius_final_512_px=radius * 512.0 / max(result.size)))
     elif case == "rgb_surface_dust":
         count = rng.randint(1, 4)
         core = Image.new("RGBA", result.size, (0, 0, 0, 0))
@@ -742,13 +941,14 @@ def _rgb_case(
         particles = []
         # Lens contamination belongs to camera-frame coordinates and must not follow the
         # battery outline when the object moves.
-        eligible: list[tuple[int, int]] = []
+        eligible = _mask_points(mask)
         long_side = max(result.size)
-        for _ in range(count):
-            radius = long_side * rng.uniform(0.01, 0.06)
+        for index in range(count):
+            # Plan specifies core diameter, so radius is half of 1%..6%.
+            radius = long_side * rng.uniform(0.005, 0.03)
             cx, cy = (
                 rng.choice(eligible)
-                if eligible
+                if index == 0 and eligible
                 else (rng.uniform(0, result.width), rng.uniform(0, result.height))
             )
             color = rng.choice(((65, 62, 58), (105, 101, 94), (145, 140, 130)))
@@ -813,7 +1013,7 @@ def _rgb_case(
         curves = []
         long_side = max(result.size)
         # A lens/protective-window fibre is fixed to the camera frame, not to the object.
-        eligible: list[tuple[int, int]] = []
+        eligible = _mask_points(mask)
         # Orient each hair along the battery outline's principal axis and centre it on the
         # mask, so most of its length stays inside the outline. Cylindrical cells occupy only
         # ~11% of the frame (mask diagonal ~0.35-0.6 of the long side), so the previous random
@@ -844,9 +1044,24 @@ def _rgb_case(
             )
             desired = rng.uniform(0.15, 0.60) * long_side
             length = min(desired, 0.60 * long_side)
-            centre = centroid + axis_major * (rng.uniform(-0.10, 0.10) * inside_len)
-            start = centre - direction * (length / 2.0)
-            end = centre + direction * (length / 2.0)
+            if rng.random() < 0.70:
+                edge = rng.choice(("left", "right", "top", "bottom"))
+                if edge == "left":
+                    start = np.array([0.0, rng.uniform(0, result.height)])
+                elif edge == "right":
+                    start = np.array([result.width - 1.0, rng.uniform(0, result.height)])
+                elif edge == "top":
+                    start = np.array([rng.uniform(0, result.width), 0.0])
+                else:
+                    start = np.array([rng.uniform(0, result.width), result.height - 1.0])
+                toward = centroid - start
+                norm = max(float(np.linalg.norm(toward)), 1e-6)
+                direction = toward / norm
+                end = start + direction * length
+            else:
+                centre = centroid + axis_major * (rng.uniform(-0.10, 0.10) * inside_len)
+                start = centre - direction * (length / 2.0)
+                end = centre + direction * (length / 2.0)
             normal = np.array([-direction[1], direction[0]])
             bend1, bend2 = rng.uniform(-0.06, 0.06), rng.uniform(-0.06, 0.06)
             points = [
@@ -897,12 +1112,19 @@ def _rgb_case(
                 intersection_ratio = 1.0
             curves.append({"control_points": points, "thickness_px": width, "thickness_range_px": [min(widths), max(widths)], "alpha": alpha / 255, "length_px": actual_length, "outline_intersection_ratio": intersection_ratio})
         blur_radius = rng.uniform(1.2, 3.8)
+        halo_multiplier = rng.uniform(2.0, 5.0)
+        halo_layer = overlay.copy()
+        halo_layer.putalpha(
+            halo_layer.getchannel("A").point(lambda value: round(value * 0.45))
+        )
+        composite = Image.alpha_composite(
+            result.convert("RGBA"),
+            halo_layer.filter(ImageFilter.GaussianBlur(blur_radius * halo_multiplier)),
+        )
         result = Image.alpha_composite(
-            result.convert("RGBA"), overlay.filter(ImageFilter.GaussianBlur(blur_radius))
+            composite, overlay.filter(ImageFilter.GaussianBlur(blur_radius))
         ).convert("RGB")
-        records.append(_record(1, "lens_fiber_shadow", severity, curve_count=count, curves=curves, blur_radius_final_space=blur_radius, coordinate_space="camera_frame"))
-        if rng.random() < 0.35:
-            records.append(_record(2, "fiber_core", severity, opacity=max(curve["alpha"] for curve in curves)))
+        records.append(_record(1, "lens_fiber_shadow", severity, curve_count=count, curves=curves, blur_radius_final_space=blur_radius, halo_multiplier=halo_multiplier, coordinate_space="camera_frame"))
     else:
         raise ValueError(f"Unknown RGB failure case: {case}")
     return result, transform, records, mask
@@ -915,17 +1137,32 @@ def apply_failure_case(
     seed: int,
     object_mask: Image.Image | None = None,
     defect_mask: Image.Image | None = None,
+    group_seed: int | None = None,
+    case_options: dict[str, Any] | None = None,
 ) -> AugmentResult:
     if modality == "CT" and failure_case not in CT_CASES:
         raise ValueError(f"Case {failure_case!r} is not valid for CT")
     if modality == "RGB" and failure_case not in RGB_CASES:
         raise ValueError(f"Case {failure_case!r} is not valid for RGB")
-    rng = random.Random(seed)
-    np_rng = np.random.default_rng(seed)
+    np_rng = np.random.Generator(np.random.PCG64(seed))
+    rng = _PCG64Random(np_rng)
+    group_rng = (
+        _PCG64Random(np.random.Generator(np.random.PCG64(group_seed)))
+        if group_seed is not None
+        else None
+    )
     severity = rng.uniform(0.62, 1.0)
     if modality == "CT":
         result, transform, records, transformed_mask = _ct_case(
-            image, failure_case, rng, np_rng, severity, object_mask, defect_mask
+            image,
+            failure_case,
+            rng,
+            np_rng,
+            severity,
+            object_mask,
+            defect_mask,
+            group_rng,
+            case_options,
         )
     else:
         result, transform, records, transformed_mask = _rgb_case(
@@ -936,6 +1173,7 @@ def apply_failure_case(
             severity,
             object_mask,
             defect_mask,
+            case_options,
         )
     validate_augmented(
         result,
@@ -985,9 +1223,37 @@ def validate_augmented(
     if {"signal_to_transmission", "linear_exposure_reduction"} & record_types:
         if output_mean > baseline_mean * 0.72:
             raise ValueError("quality_gate: underexposure is not strong enough")
+    if "linear_exposure_reduction" in record_types:
+        region = (
+            np.asarray(output_object_mask.convert("L")) > 0
+            if output_object_mask is not None
+            else np.ones(luminance.shape, dtype=bool)
+        )
+        mean_ratio = float(luminance[region].mean()) / max(
+            float(baseline[region].mean()), 1.0
+        )
+        if not 0.40 <= mean_ratio <= 0.70:
+            raise ValueError(
+                "quality_gate: underexposure outline luminance reduction is outside 30%..60%"
+            )
+        if float(baseline[region].std()) >= 1.0:
+            correlation = float(
+                np.corrcoef(baseline[region].ravel(), luminance[region].ravel())[0, 1]
+            )
+            if not np.isfinite(correlation) or correlation < 0.95:
+                raise ValueError(
+                    "quality_gate: underexposure changed the spatial lighting order"
+                )
     if "overexposure" in record_types:
         if output_mean <= baseline_mean:
             raise ValueError("quality_gate: overexposure did not increase luminance")
+        if output_object_mask is not None:
+            region = np.asarray(output_object_mask.convert("L")) > 0
+            saturation = float((luminance[region] >= 250).mean())
+            if not 0.15 <= saturation <= 0.75:
+                raise ValueError(
+                    "quality_gate: overexposure object saturation is outside 15%..75%"
+                )
 
     def edge_energy(array: np.ndarray) -> float:
         horizontal = np.abs(np.diff(array, axis=1)).mean()
@@ -998,7 +1264,8 @@ def validate_augmented(
         baseline_edge = max(edge_energy(baseline), 1e-6)
         ratio = edge_energy(luminance) / baseline_edge
         maximum = 0.75 if "defocus_blur" in record_types else 0.85
-        if ratio > maximum:
+        minimum = 0.25 if "defocus_blur" in record_types else 0.0
+        if ratio > maximum or ratio < minimum:
             raise ValueError("quality_gate: required edge-energy reduction was not reached")
 
     if "lighting_gradient" in record_types:
@@ -1025,8 +1292,17 @@ def validate_augmented(
         dark_side = sampled[axis <= float(np.quantile(axis, 0.20))]
         bright_side = sampled[axis >= float(np.quantile(axis, 0.80))]
         contrast = abs(float(bright_side.mean()) - float(dark_side.mean()))
-        if contrast / max(float(sampled.mean()), 1.0) < 0.25:
+        asymmetry = contrast / max(float(sampled.mean()), 1.0)
+        baseline_sampled = baseline[region]
+        baseline_dark = baseline_sampled[axis <= float(np.quantile(axis, 0.20))]
+        baseline_bright = baseline_sampled[axis >= float(np.quantile(axis, 0.80))]
+        baseline_asymmetry = abs(
+            float(baseline_bright.mean()) - float(baseline_dark.mean())
+        ) / max(float(baseline_sampled.mean()), 1.0)
+        if not 0.25 <= asymmetry <= 0.60:
             raise ValueError("quality_gate: uneven lighting contrast is too small")
+        if asymmetry - baseline_asymmetry < 0.15:
+            raise ValueError("quality_gate: uneven lighting did not add enough asymmetry")
 
     if "lens_dust_shadow" in record_types:
         parameters = next(
@@ -1047,6 +1323,10 @@ def validate_augmented(
             raise ValueError("quality_gate: glare core area is outside 1%..12% of object")
         if float(parameters.get("defect_coverage_ratio", 0)) > 0.70:
             raise ValueError("quality_gate: glare covers more than 70% of defect mask")
+        if bool(parameters.get("defect_present")) and float(
+            parameters.get("defect_coverage_ratio", 0)
+        ) < 0.30:
+            raise ValueError("quality_gate: glare covers less than 30% of defect mask")
         saturation = float(parameters.get("object_saturation_ratio", 0))
         if saturation > 0.12:
             raise ValueError("quality_gate: glare saturates more than 12% of object")

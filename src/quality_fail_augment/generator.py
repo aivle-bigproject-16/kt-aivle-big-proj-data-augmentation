@@ -49,6 +49,10 @@ DATASET_FIELDS = [
     "label_json_path",
     "augmentation_json_path",
     "quality_label",
+    "image_relative_path",
+    "label_json_relative_path",
+    "augmentation_json_relative_path",
+    "quality_class",
     "assignment",
     "is_augmented",
     "partition",
@@ -65,16 +69,25 @@ LINEAGE_FIELDS = [
     "synthetic_id",
     "raw_image_path",
     "raw_json_path",
+    "resolved_raw_root",
+    "source_image_relative_path",
+    "source_json_relative_path",
     "original_battery_id",
     "original_image_id",
     "new_battery_id",
     "new_image_id",
     "axis",
+    "ct_axis",
     "original_roi",
+    "ct_roi",
     "item_seed",
+    "case_seed",
+    "group_key",
+    "group_seed",
     "failure_case",
     "affine_matrix",
     "augmentation_parameters",
+    "actual_parameters_json",
 ]
 ERROR_FIELDS = [
     "synthetic_id",
@@ -84,19 +97,6 @@ ERROR_FIELDS = [
     "error",
 ]
 RECOVERY_FIELDS = ["path", "action", "reason"]
-LEGACY_QA_FIELDS = [
-    "modality",
-    "failure_case",
-    "augmentation_subtype",
-    "synthetic_id",
-    "image_path",
-    "source_filename",
-    "source_image_path",
-    "original_battery_id",
-    "reviewer",
-    "approved",
-    "reason",
-]
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -249,6 +249,9 @@ def _make_one(
         failure_case,
         int(row["item_seed"]),
         int(config.get("max_augmentation_retries", 8)),
+        int(row.get("case_seed") or row["item_seed"]),
+        int(row["group_seed"]) if row.get("group_seed") else None,
+        config,
     )
     finalized = finalize_sample(
         transformed,
@@ -285,6 +288,9 @@ def _make_one(
             "quality_label": "fail",
             "is_augmented": True,
             "item_seed": int(row["item_seed"]),
+            "case_seed": int(row.get("case_seed") or row["item_seed"]),
+            "group_key": row.get("group_key", ""),
+            "group_seed": int(row["group_seed"]) if row.get("group_seed") else None,
             "failure_case": {
                 "id": failure_case,
                 "name_ko": CASE_NAMES_KO[failure_case],
@@ -293,10 +299,21 @@ def _make_one(
             "failure_case_count": 1,
             "augmentation_count": len(records),
             "augmentations": records,
+            "automatic_checks": {
+                "passed": True,
+                "quality_gate_version": "v1.7",
+                "record_types": [record["type"] for record in records],
+                "measurements": {
+                    record["type"]: record.get("parameters", {})
+                    for record in records
+                },
+            },
             "affine_matrix": transform.matrix(),
             "output": {
                 "width": resized.width,
                 "height": resized.height,
+                "format": "JPEG",
+                "quality": int(config["jpeg_quality"]),
                 "jpeg_quality": int(config["jpeg_quality"]),
                 "image_sha256": image_hash,
                 "label_json_sha256": label_hash,
@@ -350,6 +367,10 @@ def _make_one(
         "label_json_path": relative_label.as_posix(),
         "augmentation_json_path": relative_history.as_posix() if relative_history else "",
         "quality_label": quality,
+        "image_relative_path": relative_image.as_posix(),
+        "label_json_relative_path": relative_label.as_posix(),
+        "augmentation_json_relative_path": relative_history.as_posix() if relative_history else "",
+        "quality_class": quality,
         "assignment": row["assignment"],
         "is_augmented": str(quality == "fail").lower(),
         "partition": row["partition"],
@@ -366,16 +387,27 @@ def _make_one(
         "synthetic_id": row["synthetic_id"],
         "raw_image_path": row["raw_image_path"],
         "raw_json_path": row["raw_json_path"],
+        "resolved_raw_root": str(raw_root.resolve()),
+        "source_image_relative_path": row["raw_image_path"],
+        "source_json_relative_path": row["raw_json_path"],
         "original_battery_id": row["original_battery_id"],
         "original_image_id": row["original_image_id"],
         "new_battery_id": new_battery,
         "new_image_id": new_image,
         "axis": row["axis"],
+        "ct_axis": row["axis"],
         "original_roi": json.dumps(original_roi),
+        "ct_roi": json.dumps(original_roi),
         "item_seed": row["item_seed"],
+        "case_seed": row.get("case_seed", row["item_seed"]),
+        "group_key": row.get("group_key", ""),
+        "group_seed": row.get("group_seed", ""),
         "failure_case": failure_case,
         "affine_matrix": json.dumps(transform.matrix(), separators=(",", ":")),
         "augmentation_parameters": json.dumps(
+            records, ensure_ascii=False, separators=(",", ":")
+        ),
+        "actual_parameters_json": json.dumps(
             records, ensure_ascii=False, separators=(",", ":")
         ),
     }
@@ -498,110 +530,6 @@ def _effective_jobs(config: dict[str, Any], task_count: int) -> int:
         return int(config.get("memory_probe_fallback_jobs", 1))
 
 
-def export_visual_qa_csv_legacy(
-    output: Path,
-    manifest_rows: list[dict[str, Any]],
-    config: dict[str, Any],
-) -> None:
-    """Legacy manual export helper; v1.7 generation never calls this function."""
-    if not bool(config.get("require_visual_qa_before_release", False)):
-        return
-    per_case = int(config.get("visual_qa_samples_per_case", 10))
-    minimum_rate = float(config.get("visual_qa_min_approval_rate", 0.90))
-    qa_path = output / "manifests" / "fail_visual_qa.csv"
-    lineage_path = output / "manifests" / "lineage_private.csv"
-    lineage = {
-        row["synthetic_id"]: row
-        for row in (_read_csv(lineage_path) if lineage_path.exists() else [])
-    }
-    selected: list[dict[str, Any]] = []
-    fail_rows = [row for row in manifest_rows if row["quality_label"] == "fail"]
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for row in sorted(fail_rows, key=lambda item: item["synthetic_id"]):
-        grouped.setdefault((row["modality"], row["failure_case"]), []).append(row)
-    for (modality, case), rows in sorted(grouped.items()):
-        if len(rows) < per_case:
-            raise ValueError(
-                f"visual QA sampling requires {per_case} outputs for {modality}/{case}, "
-                f"found {len(rows)}"
-            )
-        # Include each generated internal-stage signature before filling the remaining slots.
-        # This keeps optional on/off paths visible to human QA without making selection random.
-        by_subtype: dict[str, list[dict[str, Any]]] = {}
-        for row in rows:
-            by_subtype.setdefault(row.get("augmentations", ""), []).append(row)
-        case_selection = [items[0] for _, items in sorted(by_subtype.items())]
-        selected_ids = {row["synthetic_id"] for row in case_selection}
-        case_selection.extend(
-            row
-            for row in rows
-            if row["synthetic_id"] not in selected_ids
-        )
-        case_selection = case_selection[:per_case]
-        for row in case_selection:
-            source = lineage.get(row["synthetic_id"], {})
-            source_path = source.get("raw_image_path", "")
-            selected.append(
-                {
-                    "modality": modality,
-                    "failure_case": case,
-                    "augmentation_subtype": row.get("augmentations", ""),
-                    "synthetic_id": row["synthetic_id"],
-                    "image_path": row["image_path"],
-                    "source_filename": Path(source_path).name,
-                    "source_image_path": source_path,
-                    "original_battery_id": source.get("original_battery_id", ""),
-                    "reviewer": "",
-                    "approved": "",
-                    "reason": "",
-                }
-            )
-    if not qa_path.exists():
-        _write_csv(qa_path, selected, LEGACY_QA_FIELDS)
-        raise ValueError(
-            f"Visual QA approval pending: review {len(selected)} rows in {qa_path} "
-            "and rerun with --resume"
-        )
-    reviewed = _read_csv(qa_path)
-    selected_by_id = {row["synthetic_id"]: row for row in selected}
-    expected_ids = {row["synthetic_id"] for row in selected}
-    actual_ids = {row["synthetic_id"] for row in reviewed}
-    if actual_ids != expected_ids:
-        raise ValueError("Visual QA CSV sample IDs differ from the deterministic QA selection")
-    approvals: dict[tuple[str, str], list[bool]] = {}
-    for row in reviewed:
-        expected = selected_by_id[row["synthetic_id"]]
-        for field in ("source_filename", "source_image_path", "original_battery_id"):
-            if not row.get(field, "").strip():
-                raise ValueError(
-                    f"Visual QA lineage field is empty: {row['synthetic_id']} / {field}"
-                )
-            if row[field].strip() != str(expected[field]).strip():
-                raise ValueError(
-                    f"Visual QA lineage field changed: {row['synthetic_id']} / {field}"
-                )
-        value = row.get("approved", "").strip().casefold()
-        if value not in {"true", "false", "yes", "no", "1", "0"}:
-            raise ValueError(
-                f"Visual QA row is not reviewed: {row.get('synthetic_id', '')}"
-            )
-        approved = value in {"true", "yes", "1"}
-        if not row.get("reviewer", "").strip():
-            raise ValueError(
-                f"Visual QA reviewer is empty: {row.get('synthetic_id', '')}"
-            )
-        approvals.setdefault(
-            (row["modality"], row["failure_case"]), []
-        ).append(approved)
-    for key, values in approvals.items():
-        rate = sum(values) / len(values)
-        if rate < minimum_rate:
-            raise ValueError(
-                f"Visual QA approval below {minimum_rate:.0%} for {key[0]}/{key[1]}: "
-                f"{rate:.2%}; adjust parameters and regenerate the entire case"
-            )
-
-
 def generate(
     raw_root: Path,
     config: dict[str, Any],
@@ -620,6 +548,16 @@ def generate(
     logger = configure_logger("quality_fail_augment.generate", output / "logs" / "generation.log")
     rows = _read_csv(plan_path)
     _validate_plan(raw_root, config, rows, trust_plan)
+    # Publish the frozen planning contract and audit beside the generated dataset.
+    output_manifests = output / "manifests"
+    output_manifests.mkdir(parents=True, exist_ok=True)
+    for source in sorted(plan_path.parent.glob("*")):
+        if source.is_file():
+            shutil.copy2(source, output_manifests / source.name)
+    plan_log = plan_path.parent.parent / "logs" / "plan.log"
+    if plan_log.is_file():
+        (output / "logs").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(plan_log, output / "logs" / "plan.log")
     reserve_path = plan_path.parent / "reserve_sources.csv"
     reserve_rows = _read_csv(reserve_path) if reserve_path.exists() else []
     reserve_queues = {
@@ -630,6 +568,9 @@ def generate(
             )
         )
         for modality in ("CT", "RGB")
+    }
+    consumed_source_keys = {
+        (row["raw_split"].casefold(), row["source_stem"].casefold()) for row in rows
     }
     selected = list(rows)
     if limit_per_modality is not None:
@@ -720,6 +661,12 @@ def generate(
         last_error: Exception = initial_error
         queue = reserve_queues[failed_row["modality"]]
         for reserve in queue:
+            source_key = (
+                reserve["raw_split"].casefold(),
+                reserve["source_stem"].casefold(),
+            )
+            if source_key in consumed_source_keys:
+                continue
             image_path = _safe_source(raw_root, reserve["raw_image_path"])
             json_path = _safe_source(raw_root, reserve["raw_json_path"])
             if (
@@ -757,6 +704,7 @@ def generate(
                     str(raw_root), str(output), replacement, config
                 )
                 manifest["replacement_for"] = failed_row["raw_image_path"]
+                consumed_source_keys.add(source_key)
                 return (manifest, lineage), None
             except Exception as exc:
                 last_error = exc

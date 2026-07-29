@@ -52,7 +52,7 @@ class ConfigHashTests(unittest.TestCase):
             ("resize_long_side", 128),
             ("jpeg_quality", 70),
             ("ct_porosity_threshold", 0.9),
-            ("visual_qa_min_approval_rate", 0.5),
+            ("conveyor_axis", "vertical"),
             ("a_new_key_nobody_thought_of", 1),
         ):
             with self.subTest(key=key):

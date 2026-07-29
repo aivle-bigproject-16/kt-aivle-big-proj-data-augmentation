@@ -29,6 +29,7 @@ class PreparedSource:
     defect_mask: Image.Image
     original_roi: list[float] | None
     porosity_mask: Image.Image | None = None
+    porosity_ids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -115,6 +116,17 @@ def _porosity_mask(
     return combined
 
 
+def _porosity_ids(label: dict[str, Any]) -> tuple[str, ...]:
+    values: list[str] = []
+    for index, defect in enumerate(label.get("defects") or []):
+        name = str(
+            defect.get("name", defect.get("class", defect.get("label", "")))
+        ).strip().casefold()
+        if name == "porosity":
+            values.append(str(defect.get("id", index)))
+    return tuple(values)
+
+
 def prepare_source(
     image_path: Path, json_path: Path, modality: str
 ) -> PreparedSource:
@@ -140,6 +152,7 @@ def prepare_source(
         object_mask=_object_mask(label, transform, image.size, image),
         defect_mask=_defect_mask(label, transform, image.size),
         porosity_mask=_porosity_mask(label, transform, image.size),
+        porosity_ids=_porosity_ids(label),
         original_roi=original_roi,
     )
 
@@ -151,6 +164,9 @@ def apply_quality_transform(
     failure_case: str,
     item_seed: int,
     max_retries: int,
+    case_seed: int | None = None,
+    group_seed: int | None = None,
+    config: dict[str, Any] | None = None,
 ) -> TransformedSample:
     """Apply no FAIL transform for PASS, or exactly one assigned FAIL case."""
     if quality == "pass":
@@ -167,6 +183,15 @@ def apply_quality_transform(
         raise ValueError(f"Unknown quality label: {quality}")
     if not failure_case:
         raise ValueError("FAIL slot has no failure_case")
+    if (
+        modality == "CT"
+        and failure_case == "ct_cell_alignment_failure"
+        and (
+            source.porosity_mask is None
+            or source.porosity_mask.getbbox() is None
+        )
+    ):
+        raise ValueError("ct_cell_alignment_failure requires a porosity polygon")
 
     last_error: Exception | None = None
     for attempt in range(max_retries):
@@ -175,16 +200,19 @@ def apply_quality_transform(
                 source.image,
                 modality,
                 failure_case,
-                stable_seed(item_seed, "retry", attempt),
+                stable_seed(case_seed if case_seed is not None else item_seed, "retry", attempt),
                 object_mask=source.object_mask,
                 defect_mask=(
                     source.porosity_mask
                     if modality == "CT"
                     and failure_case == "ct_cell_alignment_failure"
-                    and source.porosity_mask is not None
-                    and source.porosity_mask.getbbox() is not None
                     else source.defect_mask
                 ),
+                group_seed=group_seed,
+                case_options={
+                    **(config or {}),
+                    "target_defect_ids": list(source.porosity_ids),
+                },
             )
             return TransformedSample(
                 image=result.image,

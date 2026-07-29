@@ -21,7 +21,7 @@ def _label(name: str, image_id: int, battery_id: int, modality: str) -> dict:
         },
         "defects": [
             {
-                "name": "scratch",
+                "name": "porosity" if modality == "CT" else "scratch",
                 "points": [30.0, 30.0, 50.0, 30.0, 50.0, 50.0, 30.0, 50.0],
             }
         ],
@@ -140,6 +140,14 @@ class PublicContractTests(unittest.TestCase):
             _write_raw(raw)
             metadata = create_plan(raw, _config(), plan_dir)
             self.assertEqual(metadata["selected_rows"], 8)
+            with (plan_dir / "manifests" / "generation_plan.csv").open(
+                encoding="utf-8-sig", newline=""
+            ) as handle:
+                plan_rows = list(csv.DictReader(handle))
+            self.assertTrue(all(row["synthetic_id"].startswith("QF17_") for row in plan_rows))
+            self.assertTrue(
+                {"case_seed", "group_key", "group_seed"}.issubset(plan_rows[0])
+            )
 
             summary = generate(
                 raw,
@@ -162,6 +170,13 @@ class PublicContractTests(unittest.TestCase):
             ) as handle:
                 rows = list(csv.DictReader(handle))
             for row in rows:
+                self.assertEqual(row["quality_class"], row["quality_label"])
+                self.assertEqual(row["image_relative_path"], row["image_path"])
+                self.assertEqual(row["label_json_relative_path"], row["label_json_path"])
+                self.assertEqual(
+                    row["augmentation_json_relative_path"],
+                    row["augmentation_json_path"],
+                )
                 label = json.loads((output / row["label_json_path"]).read_text(encoding="utf-8"))
                 self.assertEqual(label["quality_class"], row["quality_label"])
                 if row["quality_label"] == "pass":
@@ -175,6 +190,13 @@ class PublicContractTests(unittest.TestCase):
                     self.assertEqual(history["label_json_file"], Path(row["label_json_path"]).name)
                     self.assertEqual(history["failure_case_count"], 1)
                     self.assertEqual(history["quality_label"], "fail")
+                    self.assertTrue(history["automatic_checks"]["passed"])
+                    self.assertEqual(history["output"]["format"], "JPEG")
+                    self.assertEqual(history["output"]["quality"], 90)
+
+            self.assertTrue(
+                (output / "manifests" / "generation_plan.csv").is_file()
+            )
 
             partitions = {(row["modality"], row["partition"], row["quality_label"]) for row in rows}
             for modality in ("CT", "RGB"):
