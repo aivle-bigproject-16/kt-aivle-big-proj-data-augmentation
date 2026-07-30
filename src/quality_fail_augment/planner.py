@@ -24,7 +24,12 @@ from .common import (
     sha256_file,
     stable_seed,
 )
-from .geometry import extract_ct_roi, point_rings, porosity_bbox_metric
+from .geometry import (
+    extract_ct_roi,
+    point_rings,
+    porosity_bbox_metric,
+    repaired_polygons,
+)
 from .models import Candidate, IMAGE_SUFFIXES, ParsedName
 from .progress import ProgressReporter, configure_logger
 
@@ -109,7 +114,7 @@ def _config_hash(config: dict[str, Any]) -> str:
 
 
 def _pcg64_shuffle(values: list[Any], seed: int) -> None:
-    """Shuffle in place with the v1.7 canonical NumPy PCG64 generator."""
+    """Shuffle in place with the v1.8 canonical NumPy PCG64 generator."""
     if len(values) < 2:
         return
     order = np.random.Generator(np.random.PCG64(seed)).permutation(len(values))
@@ -119,7 +124,7 @@ def _pcg64_shuffle(values: list[Any], seed: int) -> None:
 # scan 캐시 스키마 버전. _validate_pair 가 쓰는 검증 로직 — open_normalized, pixel_hash,
 # point_rings, extract_ct_roi, porosity_bbox_metric, 필수 필드 목록 — 이 바뀌면 반드시
 # 올린다. 올리지 않으면 낡은 판정을 그대로 재사용하게 된다.
-SCAN_CACHE_VERSION = "2"
+SCAN_CACHE_VERSION = "3"
 
 SCAN_CACHE_FIELDS = [
     "cache_version",
@@ -394,9 +399,7 @@ def _validate_pair(
         if declared and Path(str(declared)).stem.casefold() != stem.casefold():
             raise ValueError(f"image_info.file_name stem mismatch: {declared}")
         outline = label.get("swelling", {}).get("battery_outline")
-        has_battery_outline = outline not in (None, [])
-        if outline not in (None, []):
-            point_rings(outline)
+        has_battery_outline = False
         defects = label.get("defects")
         if defects is not None and not isinstance(defects, list):
             raise ValueError(f"defects must be null or list, got {type(defects).__name__}")
@@ -407,6 +410,8 @@ def _validate_pair(
                 point_rings(defect.get("points"))
         image = open_normalized(image_path, modality)
         roi = extract_ct_roi(label, image.width, image.height) if modality == "CT" else None
+        outline_frame = roi if roi is not None else (0.0, 0.0, image.width, image.height)
+        has_battery_outline = bool(repaired_polygons(outline, outline_frame))
         ratio, component_count = porosity_bbox_metric(label, roi) if roi else (0.0, 0)
         image_hash = sha256_file(image_path, int(config.get("hash_chunk_bytes", 1_048_576)))
         json_hash = sha256_file(json_path, int(config.get("hash_chunk_bytes", 1_048_576)))
@@ -902,13 +907,13 @@ def create_plan(
                     (
                         position
                         for position, candidate in enumerate(available)
-                        if candidate.porosity_component_count > 0
+                        if candidate.has_battery_outline
                     ),
                     -1,
                 )
                 if eligible_index < 0:
                     raise ValueError(
-                        "CT alignment quota cannot be filled from porosity sources"
+                        "CT alignment quota cannot be filled from outline sources"
                     )
             elif failure_case == "ct_beam_hardening_metal_streak":
                 eligible_index = next(
@@ -961,7 +966,7 @@ def create_plan(
             fail = index in fail_indices
             partition = "test" if index in test_indices else "main"
             image_id = image_starts[modality] + index
-            synthetic_id = f"QF17_{modality}_{slot:08d}"
+            synthetic_id = f"QF18_{modality}_{slot:08d}"
             failure_case = case_by_index.get(index, "")
             item_seed = stable_seed(config["seed"], synthetic_id)
             case_seed = stable_seed(item_seed, failure_case) if failure_case else item_seed
@@ -1052,7 +1057,7 @@ def create_plan(
     )
     metadata = {
         "schema_version": "1.1",
-        "package_version": "1.7",
+        "package_version": "1.8",
         "raw_fingerprint": fingerprint,
         "config_sha256": config_hash,
         "plan_rows": len(plan_rows),

@@ -20,9 +20,9 @@ from test_contract import _config, _label, _write_raw
 
 class SchemaGateTests(unittest.TestCase):
     def test_version_is_exactly_plan_version(self) -> None:
-        self.assertEqual(__version__, "1.7")
+        self.assertEqual(__version__, "1.8")
 
-    def test_v17_ct_failure_cases_are_the_only_supported_ct_cases(self) -> None:
+    def test_v18_ct_failure_cases_are_the_only_supported_ct_cases(self) -> None:
         self.assertEqual(
             CT_CASES,
             (
@@ -103,13 +103,19 @@ class FailureCaseTests(unittest.TestCase):
         draw = ImageDraw.Draw(image)
         draw.rectangle((12, 12, 84, 84), outline=(230, 230, 230), width=4)
         draw.rectangle((40, 40, 55, 55), fill=(250, 250, 250))
+        object_mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(object_mask).rectangle((12, 12, 84, 84), fill=255)
         for index, case in enumerate(CT_CASES + RGB_CASES):
             modality = "CT" if case.startswith("ct_") else "RGB"
             last_error = None
             for retry in range(16):
                 try:
                     result = apply_failure_case(
-                        image, modality, case, 1000 + index * 100 + retry
+                        image,
+                        modality,
+                        case,
+                        1000 + index * 100 + retry,
+                        object_mask=object_mask,
                     )
                     break
                 except ValueError as exc:
@@ -120,7 +126,7 @@ class FailureCaseTests(unittest.TestCase):
             self.assertGreaterEqual(len(result.records), 1)
             self.assertTrue(np.isfinite(np.asarray(result.image)).all())
 
-    def test_v17_case_set_and_record_types(self) -> None:
+    def test_v18_case_set_and_record_types(self) -> None:
         self.assertNotIn("rgb_alignment_failure", RGB_CASES)
         image = Image.new("RGB", (128, 96), (90, 120, 160))
         object_mask = Image.new("L", image.size, 0)
@@ -159,6 +165,179 @@ class FailureCaseTests(unittest.TestCase):
             result.image.width / result.image.height,
             image.width / image.height,
             delta=0.02,
+        )
+
+    def test_ct_alignment_uses_gate_safe_same_size_crop_without_porosity(self) -> None:
+        image = Image.new("L", (160, 90), 20)
+        ImageDraw.Draw(image).rectangle((35, 8, 125, 82), fill=170)
+        object_mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(object_mask).rectangle((35, 8, 125, 82), fill=255)
+
+        directions = set()
+        for seed in range(8):
+            result = apply_failure_case(
+                image,
+                "CT",
+                "ct_cell_alignment_failure",
+                20260729 + seed,
+                object_mask=object_mask,
+                defect_mask=None,
+                group_seed=777 + seed,
+            )
+            self.assertEqual(result.image.size, image.size)
+            self.assertAlmostEqual(
+                result.image.width / result.image.height,
+                image.width / image.height,
+                delta=0.001,
+            )
+            self.assertEqual(result.records[0]["type"], "alignment_edge_crop")
+            directions.add(result.records[0]["parameters"]["direction"])
+            retained = result.records[0]["parameters"]["retained_outline_ratio"]
+            self.assertGreaterEqual(retained, 0.50)
+            self.assertLessEqual(retained, 0.90)
+        self.assertGreater(len(directions), 1)
+
+        with self.assertRaisesRegex(
+            ValueError, "alignment_crop_requires_object_mask"
+        ):
+            apply_failure_case(
+                image,
+                "CT",
+                "ct_cell_alignment_failure",
+                20260729,
+                object_mask=None,
+                defect_mask=None,
+            )
+
+    def test_rgb_gate_sensitive_cases_succeed_with_retry_budget(self) -> None:
+        cases = (
+            "rgb_overexposure",
+            "rgb_focus_failure",
+            "rgb_underexposure",
+            "rgb_reflection_glare",
+            "rgb_uneven_lighting",
+        )
+        variants = (
+            ((45, 70, 95), (110, 145, 175)),
+            ((105, 120, 135), (175, 195, 215)),
+            ((20, 30, 45), (70, 95, 120)),
+        )
+        for variant_index, (background, foreground) in enumerate(variants):
+            image = Image.new("RGB", (160, 90), background)
+            ImageDraw.Draw(image).rectangle((35, 8, 125, 82), fill=foreground)
+            object_mask = Image.new("L", image.size, 0)
+            ImageDraw.Draw(object_mask).rectangle((35, 8, 125, 82), fill=255)
+            defect_mask = Image.new("L", image.size, 0)
+            ImageDraw.Draw(defect_mask).ellipse((68, 35, 92, 58), fill=255)
+            for case_index, case in enumerate(cases):
+                last_error = None
+                for retry in range(8):
+                    try:
+                        result = apply_failure_case(
+                            image,
+                            "RGB",
+                            case,
+                            800_000
+                            + variant_index * 10_000
+                            + case_index * 100
+                            + retry,
+                            object_mask=object_mask,
+                            defect_mask=defect_mask,
+                        )
+                        break
+                    except ValueError as exc:
+                        last_error = exc
+                else:
+                    self.fail(
+                        f"{case} variant {variant_index} exhausted retries: "
+                        f"{last_error}"
+                    )
+                baseline = np.asarray(image.convert("L"), dtype=np.float32)
+                output = np.asarray(result.image.convert("L"), dtype=np.float32)
+                region = np.asarray(object_mask) > 0
+                if case == "rgb_overexposure":
+                    saturation = float((output[region] >= 250).mean())
+                    self.assertGreaterEqual(saturation, 0.15)
+                    self.assertLessEqual(saturation, 0.75)
+                elif case == "rgb_underexposure":
+                    mean_ratio = float(output[region].mean()) / float(
+                        baseline[region].mean()
+                    )
+                    self.assertGreaterEqual(mean_ratio, 0.40)
+                    self.assertLessEqual(mean_ratio, 0.70)
+                elif case == "rgb_reflection_glare":
+                    parameters = result.records[0]["parameters"]
+                    self.assertGreaterEqual(
+                        parameters["outline_overlap_ratio"], 0.90
+                    )
+                    self.assertGreaterEqual(
+                        parameters["core_object_area_ratio"], 0.01
+                    )
+                    self.assertLessEqual(
+                        parameters["core_object_area_ratio"], 0.12
+                    )
+                    self.assertGreaterEqual(
+                        parameters["defect_coverage_ratio"],
+                        parameters["minimum_defect_coverage_ratio"],
+                    )
+                    self.assertTrue(
+                        all(
+                            2.0 * patch["half_length"] / patch["width"] >= 5.0
+                            for patch in parameters["patches"]
+                        )
+                    )
+                elif case == "rgb_uneven_lighting":
+                    parameters = result.records[0]["parameters"]
+                    self.assertGreaterEqual(parameters["output_asymmetry"], 0.25)
+                    self.assertLessEqual(parameters["output_asymmetry"], 0.60)
+                    self.assertGreaterEqual(
+                        parameters["output_asymmetry"]
+                        - parameters["baseline_asymmetry"],
+                        0.15,
+                    )
+
+    def test_focus_gate_is_measured_in_final_512_pixel_space(self) -> None:
+        image = Image.new("RGB", (1920, 1080), (45, 70, 95))
+        ImageDraw.Draw(image).rectangle(
+            (420, 90, 1500, 990), fill=(145, 175, 205)
+        )
+        object_mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(object_mask).rectangle((420, 90, 1500, 990), fill=255)
+        result = apply_failure_case(
+            image,
+            "RGB",
+            "rgb_focus_failure",
+            20260731,
+            object_mask=object_mask,
+        )
+        baseline = np.asarray(
+            image.convert("L").resize((512, 288), Image.Resampling.LANCZOS),
+            dtype=np.float32,
+        )
+        output = np.asarray(
+            result.image.convert("L").resize(
+                (512, 288), Image.Resampling.LANCZOS
+            ),
+            dtype=np.float32,
+        )
+
+        def rms_gradient(values: np.ndarray) -> float:
+            horizontal = np.diff(values, axis=1)
+            vertical = np.diff(values, axis=0)
+            return float(
+                np.sqrt(
+                    np.mean(horizontal * horizontal)
+                    + np.mean(vertical * vertical)
+                )
+            )
+
+        ratio = rms_gradient(output) / rms_gradient(baseline)
+        self.assertGreaterEqual(ratio, 0.25)
+        self.assertLessEqual(ratio, 0.75)
+        parameters = result.records[0]["parameters"]
+        self.assertAlmostEqual(
+            parameters["radius_source_space"],
+            parameters["radius_final_space"] * 1920 / 512,
         )
 
 
