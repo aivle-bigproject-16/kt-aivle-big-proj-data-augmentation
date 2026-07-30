@@ -123,7 +123,7 @@ function Write-MeasuredConfig([string]$configPath, [string]$smokeOutput) {
     if (-not (Test-Path $summary)) { throw "smoke summary 없음: $summary" }
     $measured = Join-Path (Split-Path $configPath -Parent) (
         [IO.Path]::GetFileNameWithoutExtension($configPath) + ".measured.json")
-    & $python -X utf8 -c @"
+    $note = & $python -X utf8 -c @"
 import json, sys
 cfg = json.load(open(sys.argv[1], encoding='utf-8-sig'))
 summ = json.load(open(sys.argv[2], encoding='utf-8-sig'))
@@ -133,8 +133,13 @@ if rss <= 0:
 cfg['worker_peak_rss_bytes'] = rss
 json.dump(cfg, open(sys.argv[3], 'w', encoding='utf-8'), ensure_ascii=False, indent=2, sort_keys=True)
 print(f'measured worker_peak_rss_bytes={rss} -> {sys.argv[3]}')
-"@ $configPath $summary $measured 2>&1 | Tee-Object -FilePath $log -Append
-    if ($LASTEXITCODE -ne 0) { throw "measured config 작성 실패" }
+"@ $configPath $summary $measured 2>&1
+    $exit = $LASTEXITCODE
+    # 위 출력을 파이프라인으로 흘리면 이 함수의 반환값이 $measured 하나가 아니라 그
+    # 출력까지 담은 배열이 된다. 호출부는 그 값을 -Config 경로로 안내하므로, 문구는
+    # 호스트와 로그에만 직접 쓴다.
+    $note | ForEach-Object { Write-Host $_; Add-Content -Path $log -Value $_ }
+    if ($exit -ne 0) { throw "measured config 작성 실패" }
     return $measured
 }
 
@@ -273,7 +278,9 @@ try {
         # smoke 성공 시 측정 config 를 만든다.
         if ($Stage -eq "smoke" -and $exit -eq 0) {
             $measured = Write-MeasuredConfig $Config $Output
-            "[run_pipeline] 다음: -Stage plan -Config `"$measured`" 로 재-plan 후 generate" | Tee-Object -FilePath $log -Append
+            # worker_peak_rss_bytes 는 PERFORMANCE_ONLY_KEYS 라 plan 해시를 바꾸지 않는다.
+            # 재-plan 없이 기존 plan 그대로 generate 로 넘어간다.
+            "[run_pipeline] 다음: -Stage generate -Config `"$measured`" 로 기존 plan 그대로 생성" | Tee-Object -FilePath $log -Append
         }
     }
 }
