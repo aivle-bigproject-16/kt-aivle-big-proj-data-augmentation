@@ -22,7 +22,7 @@ class SchemaGateTests(unittest.TestCase):
     def test_version_is_exactly_plan_version(self) -> None:
         self.assertEqual(__version__, "1.8")
 
-    def test_v18_ct_failure_cases_are_the_only_supported_ct_cases(self) -> None:
+    def test_v19_ct_failure_cases_are_the_only_supported_ct_cases(self) -> None:
         self.assertEqual(
             CT_CASES,
             (
@@ -126,7 +126,7 @@ class FailureCaseTests(unittest.TestCase):
             self.assertGreaterEqual(len(result.records), 1)
             self.assertTrue(np.isfinite(np.asarray(result.image)).all())
 
-    def test_v18_case_set_and_record_types(self) -> None:
+    def test_v19_case_set_and_record_types(self) -> None:
         self.assertNotIn("rgb_alignment_failure", RGB_CASES)
         image = Image.new("RGB", (128, 96), (90, 120, 160))
         object_mask = Image.new("L", image.size, 0)
@@ -150,6 +150,165 @@ class FailureCaseTests(unittest.TestCase):
             )
             self.assertIn(record_type, {record["type"] for record in result.records})
 
+    def test_v19_draws_only_the_severe_parameter_ranges(self) -> None:
+        image = Image.new("RGB", (160, 90), (45, 70, 95))
+        ImageDraw.Draw(image).rectangle((35, 8, 125, 82), fill=(145, 175, 205))
+        ImageDraw.Draw(image).ellipse((70, 35, 90, 55), fill=(250, 250, 250))
+        object_mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(object_mask).rectangle((35, 8, 125, 82), fill=255)
+        defect_mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(defect_mask).ellipse((70, 35, 90, 55), fill=255)
+
+        results = {}
+        for index, case in enumerate(CT_CASES + RGB_CASES):
+            last_error = None
+            for retry in range(8):
+                try:
+                    results[case] = apply_failure_case(
+                        image,
+                        "CT" if case.startswith("ct_") else "RGB",
+                        case,
+                        9_000_000 + index * 100 + retry,
+                        object_mask=object_mask,
+                        defect_mask=defect_mask,
+                    )
+                    break
+                except ValueError as exc:
+                    last_error = exc
+            else:
+                self.fail(f"{case} exhausted severe-range retries: {last_error}")
+
+        def parameters(case: str, record_type: str) -> dict:
+            return next(
+                record["parameters"]
+                for record in results[case].records
+                if record["type"] == record_type
+            )
+
+        alignment = parameters(
+            "ct_cell_alignment_failure", "alignment_edge_crop"
+        )
+        self.assertTrue(
+            0.60 <= alignment["target_outline_retained_ratio"] <= 0.68
+        )
+        self.assertTrue(0.58 <= alignment["retained_outline_ratio"] <= 0.72)
+
+        motion = parameters("ct_acquisition_motion", "double_edge_ghosting")
+        blur = parameters("ct_acquisition_motion", "directional_motion_blur")
+        self.assertTrue(25.0 <= motion["offset_final_512_px"] <= 28.0)
+        self.assertTrue(0.49 <= motion["shifted_weight"] <= 0.52)
+        self.assertTrue(
+            4.0 <= blur["displacement_range_final_512_px"] <= 5.0
+        )
+
+        projection = parameters(
+            "ct_insufficient_projection_sampling", "radon_projection_drop"
+        )
+        if projection["subtype"] == "sparse_view":
+            self.assertTrue(0.20 <= projection["retained_ratio"] <= 0.30)
+        else:
+            self.assertTrue(
+                100.0 <= projection["removed_width_deg"] <= 120.0
+            )
+        reconstruction = parameters(
+            "ct_insufficient_projection_sampling", "filtered_back_projection"
+        )
+        self.assertTrue(
+            0.85 <= reconstruction["reconstruction_weight"] <= 0.90
+        )
+
+        low_signal = parameters("ct_low_signal_noise", "signal_to_transmission")
+        photons = parameters("ct_low_signal_noise", "poisson_sampling")
+        read_noise = parameters("ct_low_signal_noise", "read_noise")
+        contrast = parameters(
+            "ct_low_signal_noise", "low_contrast_attenuation"
+        )
+        self.assertTrue(0.30 <= low_signal["signal_factor"] <= 0.40)
+        self.assertTrue(10.0 <= photons["photon_scale"] <= 20.0)
+        self.assertTrue(0.015 <= read_noise["sigma_normalized"] <= 0.025)
+        self.assertTrue(0.45 <= contrast["contrast_factor"] <= 0.60)
+
+        dense = parameters(
+            "ct_beam_hardening_metal_streak", "dense_material_mask"
+        )
+        streak = parameters(
+            "ct_beam_hardening_metal_streak", "metal_anchored_streaks"
+        )
+        self.assertTrue(0.50 <= dense["attenuation"] <= 0.70)
+        self.assertTrue(56 <= streak["streak_count"] <= 72)
+        self.assertTrue(0.35 <= streak["decay_distance_ratio"] <= 0.50)
+        self.assertTrue(
+            all(
+                2.0 <= width <= 4.0
+                for width in streak["ray_widths_final_512_px"]
+            )
+        )
+
+        timing = parameters("rgb_trigger_timing_failure", "timing_edge_crop")
+        self.assertTrue(
+            0.55 <= timing["target_outline_retained_ratio"] <= 0.68
+        )
+        self.assertTrue(0.52 <= timing["retained_outline_ratio"] <= 0.72)
+
+        uneven = parameters("rgb_uneven_lighting", "lighting_gradient")
+        self.assertIn(
+            (uneven["dark_gain"], uneven["bright_gain"]),
+            {(0.25, 1.65), (0.18, 1.85), (0.12, 2.05)},
+        )
+        self.assertTrue(0.45 <= uneven["output_asymmetry"] <= 0.60)
+        self.assertGreaterEqual(
+            uneven["output_asymmetry"] - uneven["baseline_asymmetry"], 0.25
+        )
+
+        glare = parameters(
+            "rgb_reflection_glare", "surface_aware_specular_reflection"
+        )
+        self.assertEqual(len(glare["patches"]), 2)
+        self.assertTrue(0.045 <= glare["core_object_area_ratio"] <= 0.12)
+        self.assertTrue(
+            all(0.70 <= patch["alpha"] <= 0.78 for patch in glare["patches"])
+        )
+
+        focus = parameters("rgb_focus_failure", "defocus_blur")
+        self.assertTrue(7.5 <= focus["radius_final_space"] <= 10.0)
+
+        under = parameters("rgb_underexposure", "linear_exposure_reduction")
+        under_noise = parameters(
+            "rgb_underexposure", "signal_dependent_shot_noise"
+        )
+        under_read = parameters("rgb_underexposure", "sensor_read_noise")
+        self.assertTrue(0.18 <= under["exposure_factor"] <= 0.28)
+        self.assertTrue(0.44 <= under["target_outline_mean_ratio"] <= 0.50)
+        self.assertTrue(80.0 <= under_noise["photon_capacity"] <= 120.0)
+        self.assertTrue(0.010 <= under_read["sigma"] <= 0.015)
+        self.assertTrue(0.008 <= under_read["black_level"] <= 0.012)
+
+        over = parameters("rgb_overexposure", "overexposure")
+        self.assertTrue(2.10 <= over["exposure_factor"] <= 2.60)
+        self.assertTrue(
+            0.50 <= over["target_object_saturation_ratio"] <= 0.60
+        )
+
+        dust = parameters("rgb_surface_dust", "lens_dust_shadow")
+        self.assertTrue(3 <= dust["shadow_count"] <= 4)
+        self.assertTrue(
+            all(0.15 <= shadow["core_alpha"] <= 0.20 for shadow in dust["shadows"])
+        )
+        self.assertTrue(
+            all(0.08 <= shadow["halo_alpha"] <= 0.10 for shadow in dust["shadows"])
+        )
+
+        hair = parameters("rgb_hair_contamination", "lens_fiber_shadow")
+        self.assertEqual(hair["curve_count"], 2)
+        self.assertTrue(
+            all(0.18 <= curve["alpha"] <= 0.23 for curve in hair["curves"])
+        )
+        self.assertTrue(4.0 <= hair["halo_multiplier"] <= 5.0)
+        self.assertTrue(
+            all(0.08 <= alpha <= 0.10 for alpha in hair["halo_alphas"])
+        )
+        self.assertLessEqual(hair["frame_affected_ratio"], 0.35)
+
     def test_trigger_crop_preserves_source_aspect_ratio(self) -> None:
         image = Image.new("RGB", (160, 90), (120, 140, 160))
         object_mask = Image.new("L", image.size, 0)
@@ -166,6 +325,16 @@ class FailureCaseTests(unittest.TestCase):
             image.width / image.height,
             delta=0.02,
         )
+        with self.assertRaisesRegex(
+            ValueError, "timing_crop_requires_object_mask"
+        ):
+            apply_failure_case(
+                image,
+                "RGB",
+                "rgb_trigger_timing_failure",
+                20260729,
+                object_mask=None,
+            )
 
     def test_ct_alignment_uses_gate_safe_same_size_crop_without_porosity(self) -> None:
         image = Image.new("L", (160, 90), 20)
@@ -332,8 +501,8 @@ class FailureCaseTests(unittest.TestCase):
             )
 
         ratio = rms_gradient(output) / rms_gradient(baseline)
-        self.assertGreaterEqual(ratio, 0.25)
-        self.assertLessEqual(ratio, 0.75)
+        self.assertGreaterEqual(ratio, 0.15)
+        self.assertLessEqual(ratio, 0.50)
         parameters = result.records[0]["parameters"]
         self.assertAlmostEqual(
             parameters["radius_source_space"],
