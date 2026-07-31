@@ -20,7 +20,7 @@ from test_contract import _config, _label, _write_raw
 
 class SchemaGateTests(unittest.TestCase):
     def test_version_is_exactly_plan_version(self) -> None:
-        self.assertEqual(__version__, "1.8")
+        self.assertEqual(__version__, "2.0")
 
     def test_v19_ct_failure_cases_are_the_only_supported_ct_cases(self) -> None:
         self.assertEqual(
@@ -189,32 +189,32 @@ class FailureCaseTests(unittest.TestCase):
             "ct_cell_alignment_failure", "alignment_edge_crop"
         )
         self.assertTrue(
-            0.60 <= alignment["target_outline_retained_ratio"] <= 0.68
+            0.92 <= alignment["target_outline_retained_ratio"] <= 0.96
         )
-        self.assertTrue(0.58 <= alignment["retained_outline_ratio"] <= 0.72)
+        self.assertTrue(0.90 <= alignment["retained_outline_ratio"] <= 0.98)
 
         motion = parameters("ct_acquisition_motion", "double_edge_ghosting")
         blur = parameters("ct_acquisition_motion", "directional_motion_blur")
-        self.assertTrue(25.0 <= motion["offset_final_512_px"] <= 28.0)
-        self.assertTrue(0.49 <= motion["shifted_weight"] <= 0.52)
+        self.assertTrue(6.0 <= motion["offset_final_512_px"] <= 9.0)
+        self.assertTrue(0.15 <= motion["shifted_weight"] <= 0.22)
         self.assertTrue(
-            4.0 <= blur["displacement_range_final_512_px"] <= 5.0
+            0.5 <= blur["displacement_range_final_512_px"] <= 1.2
         )
 
         projection = parameters(
             "ct_insufficient_projection_sampling", "radon_projection_drop"
         )
         if projection["subtype"] == "sparse_view":
-            self.assertTrue(0.20 <= projection["retained_ratio"] <= 0.30)
+            self.assertTrue(0.72 <= projection["retained_ratio"] <= 0.82)
         else:
             self.assertTrue(
-                100.0 <= projection["removed_width_deg"] <= 120.0
+                15.0 <= projection["removed_width_deg"] <= 25.0
             )
         reconstruction = parameters(
             "ct_insufficient_projection_sampling", "filtered_back_projection"
         )
         self.assertTrue(
-            0.85 <= reconstruction["reconstruction_weight"] <= 0.90
+            0.25 <= reconstruction["reconstruction_weight"] <= 0.40
         )
 
         low_signal = parameters("ct_low_signal_noise", "signal_to_transmission")
@@ -223,10 +223,10 @@ class FailureCaseTests(unittest.TestCase):
         contrast = parameters(
             "ct_low_signal_noise", "low_contrast_attenuation"
         )
-        self.assertTrue(0.30 <= low_signal["signal_factor"] <= 0.40)
-        self.assertTrue(10.0 <= photons["photon_scale"] <= 20.0)
-        self.assertTrue(0.015 <= read_noise["sigma_normalized"] <= 0.025)
-        self.assertTrue(0.45 <= contrast["contrast_factor"] <= 0.60)
+        self.assertTrue(0.78 <= low_signal["signal_factor"] <= 0.86)
+        self.assertTrue(90.0 <= photons["photon_scale"] <= 130.0)
+        self.assertTrue(0.001 <= read_noise["sigma_normalized"] <= 0.002)
+        self.assertTrue(0.95 <= contrast["contrast_factor"] <= 1.00)
 
         dense = parameters(
             "ct_beam_hardening_metal_streak", "dense_material_mask"
@@ -234,12 +234,12 @@ class FailureCaseTests(unittest.TestCase):
         streak = parameters(
             "ct_beam_hardening_metal_streak", "metal_anchored_streaks"
         )
-        self.assertTrue(0.50 <= dense["attenuation"] <= 0.70)
-        self.assertTrue(56 <= streak["streak_count"] <= 72)
-        self.assertTrue(0.35 <= streak["decay_distance_ratio"] <= 0.50)
+        self.assertTrue(0.05 <= dense["attenuation"] <= 0.10)
+        self.assertTrue(8 <= streak["streak_count"] <= 12)
+        self.assertTrue(0.15 <= streak["decay_distance_ratio"] <= 0.22)
         self.assertTrue(
             all(
-                2.0 <= width <= 4.0
+                0.4 <= width <= 0.8
                 for width in streak["ray_widths_final_512_px"]
             )
         )
@@ -291,11 +291,12 @@ class FailureCaseTests(unittest.TestCase):
 
         dust = parameters("rgb_surface_dust", "lens_dust_shadow")
         self.assertTrue(3 <= dust["shadow_count"] <= 4)
+        self.assertTrue(1 <= dust["object_overlap_shadow_count"] <= 2)
         self.assertTrue(
-            all(0.15 <= shadow["core_alpha"] <= 0.20 for shadow in dust["shadows"])
+            all(0.22 <= shadow["core_alpha"] <= 0.25 for shadow in dust["shadows"])
         )
         self.assertTrue(
-            all(0.08 <= shadow["halo_alpha"] <= 0.10 for shadow in dust["shadows"])
+            all(0.10 <= shadow["halo_alpha"] <= 0.125 for shadow in dust["shadows"])
         )
 
         hair = parameters("rgb_hair_contamination", "lens_fiber_shadow")
@@ -362,8 +363,8 @@ class FailureCaseTests(unittest.TestCase):
             self.assertEqual(result.records[0]["type"], "alignment_edge_crop")
             directions.add(result.records[0]["parameters"]["direction"])
             retained = result.records[0]["parameters"]["retained_outline_ratio"]
-            self.assertGreaterEqual(retained, 0.50)
-            self.assertLessEqual(retained, 0.90)
+            self.assertGreaterEqual(retained, 0.90)
+            self.assertLessEqual(retained, 0.98)
         self.assertGreater(len(directions), 1)
 
         with self.assertRaisesRegex(

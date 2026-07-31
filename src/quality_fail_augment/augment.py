@@ -42,7 +42,7 @@ CASE_NAMES_KO = {
     "rgb_surface_dust": "렌즈·보호유리 먼지 오염",
     "rgb_hair_contamination": "렌즈·보호유리 섬유 오염",
 }
-SOURCE_REFERENCES = {case: f"v1.8:{case}" for case in (*CT_CASES, *RGB_CASES)}
+SOURCE_REFERENCES = {case: f"v2.0:{case}" for case in (*CT_CASES, *RGB_CASES)}
 UNEVEN_TAIL_QUANTILE = 0.20
 UNEVEN_MIN_ASYMMETRY = 0.45
 UNEVEN_MAX_ASYMMETRY = 0.60
@@ -334,7 +334,7 @@ def _ct_case(
                 candidate[2] -= trim - trim // 2
             return candidate
 
-        target_retained_ratio = rng.uniform(0.60, 0.68)
+        target_retained_ratio = rng.uniform(0.92, 0.96)
         selected: tuple[str, list[int], float | None] | None = None
         if mask is None or mask.getbbox() is None:
             raise ValueError("alignment_crop_requires_object_mask")
@@ -369,7 +369,7 @@ def _ct_case(
                         low_amount = min(amount + 1, high_amount)
                     else:
                         high_amount = max(amount - 1, low_amount)
-                if 0.58 <= best_retained <= 0.72:
+                if 0.90 <= best_retained <= 0.98:
                     selected = (direction, best_crop, best_retained)
                     break
             if selected is None:
@@ -412,16 +412,16 @@ def _ct_case(
     elif case == "ct_acquisition_motion":
         direction_rng = group_rng or rng
         angle = direction_rng.uniform(0, 359)
-        normalized_offset = rng.uniform(25.0, 28.0)
+        normalized_offset = rng.uniform(6.0, 9.0)
         scale = max(result.size) / 512.0
         offset = max(1, round(normalized_offset * scale))
         dx = round(math.cos(math.radians(angle)) * offset)
         dy = round(math.sin(math.radians(angle)) * offset)
-        blur_half_range = rng.uniform(4.0, 5.0)
-        kernel = max(9, (round((blur_half_range * 2 + 1) * scale) | 1))
+        blur_half_range = rng.uniform(0.5, 1.2)
+        kernel = max(3, (round((blur_half_range * 2 + 1) * scale) | 1))
         blurred = _motion_blur(result, kernel, angle)
         shifted = _translate(result, dx, dy, background(result, "CT"))
-        shifted_weight = rng.uniform(0.49, 0.52)
+        shifted_weight = rng.uniform(0.15, 0.22)
         result = Image.blend(blurred, shifted, shifted_weight)
         records.append(
             _record(
@@ -447,17 +447,17 @@ def _ct_case(
             )
         )
     elif case == "ct_low_signal_noise":
-        factor = rng.uniform(0.30, 0.40)
+        factor = rng.uniform(0.78, 0.86)
         result = ImageEnhance.Brightness(result).enhance(factor)
         records.append(_record(1, "signal_to_transmission", severity, signal_factor=factor))
         source = np.asarray(result.convert("L"), dtype=np.float32)
-        photons = rng.uniform(10.0, 20.0)
+        photons = rng.uniform(90.0, 130.0)
         sampled = np_rng.poisson(np.clip(source / 255.0, 0, 1) * photons) / photons * 255.0
         result = Image.fromarray(np.clip(sampled, 0, 255).astype(np.uint8)).convert(
             result.mode
         )
         records.append(_record(2, "poisson_sampling", severity, photon_scale=photons))
-        sigma_normalized = rng.uniform(0.015, 0.025)
+        sigma_normalized = rng.uniform(0.001, 0.002)
         sigma_8bit = sigma_normalized * 255.0
         result = _noise(result, np_rng, sigma_8bit, monochrome=True)
         records.append(
@@ -469,7 +469,7 @@ def _ct_case(
                 sigma_8bit=sigma_8bit,
             )
         )
-        contrast_factor = rng.uniform(0.45, 0.60)
+        contrast_factor = rng.uniform(0.95, 1.00)
         result = ImageEnhance.Contrast(result).enhance(contrast_factor)
         records.append(
             _record(
@@ -487,13 +487,13 @@ def _ct_case(
         full_angles = np.linspace(0.0, 180.0, full_view_count, endpoint=False)
         subtype = rng.choice(("sparse_view", "limited_angle"))
         if subtype == "sparse_view":
-            retained_ratio = rng.uniform(0.20, 0.30)
+            retained_ratio = rng.uniform(0.72, 0.82)
             view_count = max(8, round(full_view_count * retained_ratio))
             indices = np.linspace(0, full_view_count - 1, view_count).round().astype(int)
             angles = full_angles[indices]
             removed_angle = None
         else:
-            removed_width = rng.uniform(100.0, 120.0)
+            removed_width = rng.uniform(15.0, 25.0)
             removed_start = rng.uniform(0.0, 180.0)
             distance = (full_angles - removed_start) % 180.0
             angles = full_angles[distance >= removed_width]
@@ -527,7 +527,7 @@ def _ct_case(
             255.0,
         )
         baseline = np.asarray(gray, dtype=np.float32)
-        reconstruction_weight = rng.uniform(0.85, 0.90)
+        reconstruction_weight = rng.uniform(0.25, 0.40)
         result = Image.fromarray(
             np.clip(
                 (1.0 - reconstruction_weight) * baseline
@@ -569,7 +569,7 @@ def _ct_case(
         dense_region_mask = _largest_connected_component(array >= threshold)
         if float(dense_region_mask.mean()) < 0.001:
             raise ValueError("dense_region_mask_too_small")
-        attenuation = rng.uniform(0.50, 0.70)
+        attenuation = rng.uniform(0.05, 0.10)
         target = np.asarray(result).astype(np.float32)
         target[dense_region_mask] *= 1.0 - attenuation
         result = _array_image(target, result.mode)
@@ -598,9 +598,9 @@ def _ct_case(
             (xx - center_x) / radius_x, -1.0, 1.0
         )
         cupping_delta = (
-            rng.uniform(60.0, 80.0)
+            rng.uniform(8.0, 15.0)
             if rng.random() < 0.5
-            else rng.uniform(-25.0, -18.0)
+            else rng.uniform(-4.0, -2.0)
         )
         cupping_profile = np.clip(1.0 - elliptical, 0.0, 1.0)
         feather_ratio = rng.uniform(0.08, 0.14)
@@ -623,7 +623,7 @@ def _ct_case(
                 feather_ratio=feather_ratio,
             )
         )
-        count = rng.randint(56, 72)
+        count = rng.randint(8, 12)
         field = Image.new("F", result.size, 0.0)
         draw = ImageDraw.Draw(field)
         diagonal = math.hypot(result.width, result.height)
@@ -640,10 +640,10 @@ def _ct_case(
                 + rng.uniform(-jitter_limit, jitter_limit)
             ) % 360.0
             angle = math.radians(angle_deg)
-            normalized_width = rng.uniform(2.0, 4.0)
+            normalized_width = rng.uniform(0.4, 0.8)
             source_scale = max(result.size) / 512.0
             width = max(1, round(normalized_width * source_scale))
-            alpha = rng.uniform(0.25, 0.35)
+            alpha = rng.uniform(0.02, 0.05)
             delta = rng.choice((-1, 1)) * alpha * 255.0
             draw.line(
                 (
@@ -669,7 +669,7 @@ def _ct_case(
                 (result.width - 1.0, result.height - 1.0),
             )
         )
-        decay_distance_ratio = rng.uniform(0.35, 0.50)
+        decay_distance_ratio = rng.uniform(0.15, 0.22)
         decay_scale = frame_distance * decay_distance_ratio
         streak_field *= np.exp(-distance / max(decay_scale, 1.0))
         if object_mask is not None:
@@ -1389,6 +1389,7 @@ def _rgb_case(
             )
     elif case == "rgb_surface_dust":
         count = rng.randint(3, 4)
+        object_overlap_count = rng.randint(1, 2)
         core = Image.new("RGBA", result.size, (0, 0, 0, 0))
         halo = Image.new("RGBA", result.size, (0, 0, 0, 0))
         core_draw = ImageDraw.Draw(core)
@@ -1402,17 +1403,22 @@ def _rgb_case(
             # v1.9 uses a small number of large, out-of-focus lens shadows.
             # Radius is half of the planned 4%..6% core diameter.
             radius = long_side * rng.uniform(0.02, 0.03)
+            # Keep one or two lens shadows over the projected battery area so the
+            # contamination can actually interfere with inspection. The effect is
+            # still rendered in camera-frame coordinates and does not follow the object.
             cx, cy = (
                 rng.choice(eligible)
-                if index == 0 and eligible
+                if index < object_overlap_count and eligible
                 else (rng.uniform(0, result.width), rng.uniform(0, result.height))
             )
             color = rng.choice(((65, 62, 58), (105, 101, 94), (145, 140, 130)))
-            core_alpha_ratio = rng.uniform(0.15, 0.20)
-            halo_alpha_ratio = rng.uniform(0.08, 0.10)
+            # Calibrated against the approved 0731_188 sample: visible enough to
+            # obstruct inspection without turning into an opaque painted patch.
+            core_alpha_ratio = rng.uniform(0.22, 0.25)
+            halo_alpha_ratio = rng.uniform(0.10, 0.125)
             core_alpha = round(255 * core_alpha_ratio)
             halo_alpha = round(255 * halo_alpha_ratio)
-            halo_scale = rng.uniform(2.5, 3.5)
+            halo_scale = rng.uniform(2.6, 3.3)
             ellipse_ratio = rng.uniform(0.70, 1.30)
             radial_jitter = [rng.uniform(0.78, 1.22) for _ in range(16)]
 
@@ -1452,7 +1458,7 @@ def _rgb_case(
                     "ellipse_ratio": ellipse_ratio,
                 }
             )
-        blur_radius = long_side * rng.uniform(0.008, 0.025)
+        blur_radius = long_side * rng.uniform(0.009, 0.014)
         blur_radius_final = blur_radius * 512.0 / long_side
         composite = Image.alpha_composite(
             result.convert("RGBA"),
@@ -1485,6 +1491,7 @@ def _rgb_case(
                 "lens_dust_shadow",
                 severity,
                 shadow_count=count,
+                object_overlap_shadow_count=object_overlap_count,
                 shadows=particles,
                 frame_affected_ratio=float(dust_mask.mean()),
                 blur_radius_final_space=blur_radius_final,
@@ -1736,25 +1743,25 @@ def validate_augmented(
         projection = record_parameters("radon_projection_drop")
         subtype = str(projection.get("subtype"))
         if subtype == "sparse_view":
-            if not 0.20 <= float(projection.get("retained_ratio", 0)) <= 0.30:
+            if not 0.72 <= float(projection.get("retained_ratio", 0)) <= 0.82:
                 raise ValueError(
-                    "quality_gate: sparse-view retained ratio is outside 0.20..0.30"
+                    "quality_gate: sparse-view retained ratio is outside 0.72..0.82"
                 )
         elif subtype == "limited_angle":
-            if not 100.0 <= float(
+            if not 15.0 <= float(
                 projection.get("removed_width_deg", 0)
-            ) <= 120.0:
+            ) <= 25.0:
                 raise ValueError(
-                    "quality_gate: limited-angle removal is outside 100..120 degrees"
+                    "quality_gate: limited-angle removal is outside 15..25 degrees"
                 )
         else:
             raise ValueError("quality_gate: unknown projection-drop subtype")
         reconstruction = record_parameters("filtered_back_projection")
-        if not 0.85 <= float(
+        if not 0.25 <= float(
             reconstruction.get("reconstruction_weight", 0)
-        ) <= 0.90:
+        ) <= 0.40:
             raise ValueError(
-                "quality_gate: reconstruction weight is outside 0.85..0.90"
+                "quality_gate: reconstruction weight is outside 0.25..0.40"
             )
 
     if "signal_to_transmission" in record_types:
@@ -1763,12 +1770,12 @@ def validate_augmented(
         read_noise = record_parameters("read_noise")
         contrast = record_parameters("low_contrast_attenuation")
         if (
-            not 0.30 <= float(signal.get("signal_factor", 0)) <= 0.40
-            or not 10.0 <= float(photons.get("photon_scale", 0)) <= 20.0
-            or not 0.015
+            not 0.78 <= float(signal.get("signal_factor", 0)) <= 0.86
+            or not 90.0 <= float(photons.get("photon_scale", 0)) <= 130.0
+            or not 0.001
             <= float(read_noise.get("sigma_normalized", 0))
-            <= 0.025
-            or not 0.45 <= float(contrast.get("contrast_factor", 0)) <= 0.60
+            <= 0.002
+            or not 0.95 <= float(contrast.get("contrast_factor", 0)) <= 1.00
         ):
             raise ValueError(
                 "quality_gate: CT low-signal parameters are outside v1.9 range"
@@ -1781,10 +1788,10 @@ def validate_augmented(
         luminance_delta = float(cupping.get("luminance_delta", 0))
         feather_ratio = float(cupping.get("feather_ratio", 0))
         if (
-            not 0.50 <= attenuation <= 0.70
+            not 0.05 <= attenuation <= 0.10
             or not (
-                60.0 <= luminance_delta <= 80.0
-                or -25.0 <= luminance_delta <= -18.0
+                8.0 <= luminance_delta <= 15.0
+                or -4.0 <= luminance_delta <= -2.0
             )
             or not 0.08 <= feather_ratio <= 0.14
         ):
@@ -1894,7 +1901,10 @@ def validate_augmented(
     baseline_mean = max(float(baseline.mean()), 1.0)
     output_mean = float(luminance.mean())
 
-    if {"signal_to_transmission", "linear_exposure_reduction"} & record_types:
+    if "signal_to_transmission" in record_types:
+        if output_mean > baseline_mean * 0.96:
+            raise ValueError("quality_gate: CT low-signal effect is not strong enough")
+    if "linear_exposure_reduction" in record_types:
         if output_mean > baseline_mean * 0.72:
             raise ValueError("quality_gate: underexposure is not strong enough")
     if "linear_exposure_reduction" in record_types:
@@ -1995,14 +2005,14 @@ def validate_augmented(
             for record in records
             if record["type"] == "directional_motion_blur"
         )
-        if not 25.0 <= float(ghost["offset_final_512_px"]) <= 28.0:
-            raise ValueError("quality_gate: CT ghost offset is outside 25..28px")
-        if not 0.49 <= float(ghost["shifted_weight"]) <= 0.52:
-            raise ValueError("quality_gate: CT ghost blend is outside 0.49..0.52")
-        if not 4.0 <= float(
+        if not 6.0 <= float(ghost["offset_final_512_px"]) <= 9.0:
+            raise ValueError("quality_gate: CT ghost offset is outside 6..9px")
+        if not 0.15 <= float(ghost["shifted_weight"]) <= 0.22:
+            raise ValueError("quality_gate: CT ghost blend is outside 0.15..0.22")
+        if not 0.5 <= float(
             motion["displacement_range_final_512_px"]
-        ) <= 5.0:
-            raise ValueError("quality_gate: CT motion blur range is outside 4..5px")
+        ) <= 1.2:
+            raise ValueError("quality_gate: CT motion blur range is outside 0.5..1.2px")
 
     if "lighting_gradient" in record_types:
         # Comparing fixed left/right and top/bottom halves under-reads a diagonal gradient and
@@ -2037,6 +2047,13 @@ def validate_augmented(
         count = int(parameters.get("shadow_count", 0))
         if not 3 <= count <= 4:
             raise ValueError("quality_gate: lens dust shadow count is outside 3..4")
+        object_overlap_count = int(
+            parameters.get("object_overlap_shadow_count", 0)
+        )
+        if not 1 <= object_overlap_count <= 2:
+            raise ValueError(
+                "quality_gate: lens dust object overlap count is outside 1..2"
+            )
         coverage = float(parameters.get("frame_affected_ratio", 0))
         if not 0.001 <= coverage <= 0.35:
             raise ValueError("quality_gate: lens dust frame coverage is outside range")
@@ -2045,9 +2062,9 @@ def validate_augmented(
             not 0.04
             <= float(shadow.get("diameter_long_side_ratio", 0))
             <= 0.06
-            or not 0.15 <= float(shadow.get("core_alpha", 0)) <= 0.20
-            or not 2.5 <= float(shadow.get("halo_scale", 0)) <= 3.5
-            or not 0.08 <= float(shadow.get("halo_alpha", 0)) <= 0.10
+            or not 0.22 <= float(shadow.get("core_alpha", 0)) <= 0.25
+            or not 2.6 <= float(shadow.get("halo_scale", 0)) <= 3.3
+            or not 0.10 <= float(shadow.get("halo_alpha", 0)) <= 0.125
             for shadow in shadows
         ):
             raise ValueError("quality_gate: lens dust parameters are outside v1.9 range")
@@ -2084,30 +2101,30 @@ def validate_augmented(
                 "quality_gate: photon-starvation streak does not cross dense region"
             )
         quadrants = streak_record["parameters"].get("quadrant_counts", [])
-        if len(quadrants) != 4 or any(int(count) < 4 for count in quadrants):
+        if len(quadrants) != 4 or any(int(count) < 1 for count in quadrants):
             raise ValueError(
                 "quality_gate: metal streak rays do not cover all four quadrants"
             )
-        if float(streak_record["parameters"].get("max_angular_gap_deg", 360)) > 35:
+        if float(streak_record["parameters"].get("max_angular_gap_deg", 360)) > 55:
             raise ValueError(
-                "quality_gate: metal streak maximum angular gap exceeds 35 degrees"
+                "quality_gate: metal streak maximum angular gap exceeds 55 degrees"
             )
         widths = streak_record["parameters"].get(
             "ray_widths_final_512_px", []
         )
         alphas = streak_record["parameters"].get("ray_start_alphas", [])
         if (
-            not 56
+            not 8
             <= int(streak_record["parameters"].get("streak_count", 0))
-            <= 72
+            <= 12
             or len(widths) != len(alphas)
-            or any(not 2.0 <= float(width) <= 4.0 for width in widths)
-            or any(not 0.25 <= float(alpha) <= 0.35 for alpha in alphas)
-            or not 0.35
+            or any(not 0.4 <= float(width) <= 0.8 for width in widths)
+            or any(not 0.02 <= float(alpha) <= 0.05 for alpha in alphas)
+            or not 0.15
             <= float(
                 streak_record["parameters"].get("decay_distance_ratio", 0)
             )
-            <= 0.50
+            <= 0.22
         ):
             raise ValueError(
                 "quality_gate: metal streak parameters are outside v1.9 range"
@@ -2150,10 +2167,10 @@ def validate_augmented(
             record for record in records if record["type"] == "alignment_edge_crop"
         )
         retained = alignment_record["parameters"].get("retained_outline_ratio")
-        if retained is not None and not 0.58 <= float(retained) <= 0.72:
+        if retained is not None and not 0.90 <= float(retained) <= 0.98:
             raise ValueError(
                 f"quality_gate: alignment outline retention {float(retained):.3f} "
-                "is outside 0.58..0.72"
+                "is outside 0.90..0.98"
             )
     if (
         original_object_mask is not None

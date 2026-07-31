@@ -1,4 +1,5 @@
 {
+  "use_embedded_scan_cache": true,
   "ct_target": 20000,
   "ct_augmented_target": 2000,
   "ct_test_target": 1000,
@@ -10,19 +11,26 @@
     "ct_low_signal_noise": 400,
     "ct_beam_hardening_metal_streak": 400
   },
+  "ct_test_failure_case_quotas": {
+    "ct_cell_alignment_failure": 20,
+    "ct_acquisition_motion": 20,
+    "ct_insufficient_projection_sampling": 20,
+    "ct_low_signal_noise": 20,
+    "ct_beam_hardening_metal_streak": 20
+  },
   "rgb_target": 20000,
-  "rgb_augmented_target": 2000,
+  "rgb_augmented_target": 10500,
   "rgb_test_target": 1000,
-  "rgb_test_fail_target": 100,
+  "rgb_test_fail_target": 1000,
   "rgb_failure_case_quotas": {
-    "rgb_trigger_timing_failure": 230,
-    "rgb_uneven_lighting": 270,
-    "rgb_reflection_glare": 270,
-    "rgb_focus_failure": 310,
-    "rgb_underexposure": 270,
-    "rgb_overexposure": 270,
-    "rgb_surface_dust": 190,
-    "rgb_hair_contamination": 190
+    "rgb_trigger_timing_failure": 1208,
+    "rgb_uneven_lighting": 1418,
+    "rgb_reflection_glare": 1418,
+    "rgb_focus_failure": 1628,
+    "rgb_underexposure": 1417,
+    "rgb_overexposure": 1417,
+    "rgb_surface_dust": 997,
+    "rgb_hair_contamination": 997
   },
   "reserve_per_modality": 500,
   "resize_long_side": 512,
