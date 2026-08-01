@@ -23,7 +23,7 @@ import shapely
 from PIL import Image
 
 from . import __version__
-from .augment import CASE_NAMES_KO, SOURCE_REFERENCES
+from .augment import CASE_NAMES_KO, EXHAUSTED_SEARCH_MARKER, SOURCE_REFERENCES
 from .common import (
     atomic_write,
     canonical_json_bytes,
@@ -97,6 +97,13 @@ ERROR_FIELDS = [
     "error",
 ]
 RECOVERY_FIELDS = ["path", "action", "reason"]
+
+# How many reserve sources one failed sample may try before it is recorded as a
+# failure. Walking the whole queue costs a SHA-256 of both files plus a full
+# augmentation per entry, so an unbounded walk let a few hundred failures consume
+# hours. This is a safety bound rather than a tuning knob, so it stays out of the
+# config and cannot perturb the plan hash.
+RESERVE_ATTEMPTS_PER_SAMPLE = 40
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -572,6 +579,9 @@ def generate(
     consumed_source_keys = {
         (row["raw_split"].casefold(), row["source_stem"].casefold()) for row in rows
     }
+    # (source_key, failure_case) pairs whose geometry search is known to be
+    # unsatisfiable. Kept for the whole run so one dead reserve is paid for once.
+    exhausted_reserve_keys: set[tuple[tuple[str, str], str]] = set()
     selected = list(rows)
     if limit_per_modality is not None:
         limited: list[dict[str, str]] = []
@@ -660,13 +670,24 @@ def generate(
     ) -> tuple[Any | None, Exception | None]:
         last_error: Exception = initial_error
         queue = reserve_queues[failed_row["modality"]]
+        failure_case = failed_row.get("failure_case", "")
+        attempts = 0
         for reserve in queue:
+            if attempts >= RESERVE_ATTEMPTS_PER_SAMPLE:
+                break
             source_key = (
                 reserve["raw_split"].casefold(),
                 reserve["source_stem"].casefold(),
             )
             if source_key in consumed_source_keys:
                 continue
+            # A reserve that exhausted its search for this case will do so again:
+            # the search is driven by the source image, not by the seed. Without
+            # this memo every later failure re-walked the same dead reserves, which
+            # is what turned a few hundred failures into an unfinishable run.
+            if (source_key, failure_case) in exhausted_reserve_keys:
+                continue
+            attempts += 1
             image_path = _safe_source(raw_root, reserve["raw_image_path"])
             json_path = _safe_source(raw_root, reserve["raw_json_path"])
             if (
@@ -708,6 +729,8 @@ def generate(
                 return (manifest, lineage), None
             except Exception as exc:
                 last_error = exc
+                if EXHAUSTED_SEARCH_MARKER in str(exc):
+                    exhausted_reserve_keys.add((source_key, failure_case))
         return None, last_error
 
     def consume(row: dict[str, str], result: Any = None, error: Exception | None = None) -> None:

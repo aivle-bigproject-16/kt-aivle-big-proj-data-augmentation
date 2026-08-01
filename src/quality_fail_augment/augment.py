@@ -10,6 +10,23 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 from .geometry import Affine
 
 
+# Worker failures cross a process boundary and arrive as plain strings, so the
+# generator recognises this class of failure by this marker rather than by type.
+EXHAUSTED_SEARCH_MARKER = "augmentation search exhausted"
+
+
+class ExhaustedSearchError(ValueError):
+    """No candidate exists for this source, and trying again cannot change that.
+
+    The geometry searches behind the `*_no_gate_safe_*` failures enumerate a fixed
+    grid derived from the source image. They do not consume the seed that the retry
+    loop varies, so a second attempt repeats the same computation and fails the same
+    way. Callers should stop retrying and move to a different source; retrying was
+    measured to burn eight identical attempts per sample and, once the widened glare
+    search made each attempt costly, it stalled whole runs.
+    """
+
+
 CT_CASES = (
     "ct_cell_alignment_failure",
     "ct_acquisition_motion",
@@ -421,7 +438,7 @@ def _ct_case(
                     selected = (direction, best_crop, best_retained)
                     break
             if selected is None:
-                raise ValueError("alignment_crop_no_gate_safe_window")
+                raise ExhaustedSearchError("alignment_crop_no_gate_safe_window")
 
         direction, crop, retained_outline_ratio = selected
         cropped_width = crop[2] - crop[0]
@@ -1008,7 +1025,7 @@ def _rgb_case(
             if selected_gradient is not None:
                 break
         if selected_gradient is None:
-            raise ValueError("uneven_lighting_no_gate_safe_gradient")
+            raise ExhaustedSearchError("uneven_lighting_no_gate_safe_gradient")
         (
             angle_deg,
             dark,
@@ -1358,7 +1375,7 @@ def _rgb_case(
                 )
 
         if best_candidate is None:
-            raise ValueError("glare_no_gate_safe_geometry")
+            raise ExhaustedSearchError("glare_no_gate_safe_geometry")
         _, glare_alpha, patches, core_object_ratio, defect_coverage = best_candidate
         radius_final = rng.uniform(10, 14)
         radius = radius_final * max(result.size) / 512.0

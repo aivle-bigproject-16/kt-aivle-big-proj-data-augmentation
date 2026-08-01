@@ -15,7 +15,11 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw
 
-from ..augment import apply_failure_case
+from ..augment import (
+    EXHAUSTED_SEARCH_MARKER,
+    ExhaustedSearchError,
+    apply_failure_case,
+)
 from ..common import load_json, open_normalized, stable_seed
 from ..geometry import Affine, extract_ct_roi, point_rings, transform_label
 
@@ -206,6 +210,12 @@ def apply_quality_transform(
                 records=result.records,
                 original_roi=source.original_roi,
             )
+        except ExhaustedSearchError as exc:
+            # The geometry search enumerated its whole grid and found nothing. It
+            # never reads the seed this loop varies, so the remaining attempts would
+            # repeat the same work and fail identically. Give up now and let the
+            # caller substitute a different source.
+            raise ValueError(f"{EXHAUSTED_SEARCH_MARKER}: {exc}") from exc
         except Exception as exc:
             last_error = exc
     raise ValueError(f"augmentation retries exhausted: {last_error}")
