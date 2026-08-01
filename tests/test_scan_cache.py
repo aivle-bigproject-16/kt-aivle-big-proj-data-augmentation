@@ -14,6 +14,7 @@ from quality_fail_augment.planner import (
     PERFORMANCE_ONLY_KEYS,
     SCAN_CACHE_FIELDS,
     SCAN_CACHE_VERSION,
+    _select_battery_group_subset,
     _config_hash,
     _index_raw,
     _load_scan_cache,
@@ -27,6 +28,47 @@ from test_contract import _config, _write_raw
 def _cache_rows(path: Path) -> dict[str, dict[str, str]]:
     with path.open(encoding="utf-8-sig", newline="") as handle:
         return {row["image_stem"]: row for row in csv.DictReader(handle)}
+
+
+class BatteryGroupSplitTests(unittest.TestCase):
+    def test_ct_split_does_not_preprotect_every_battery(self) -> None:
+        # Production has only 47 CT battery IDs.  The old v2.0 code protected
+        # every group for main before DP even though 112+434+454 is a valid
+        # leakage-free 1,000-image test subset.
+        sizes = [112, 434, 454] + [432] * 43 + [424]
+        self.assertEqual(sum(sizes), 20_000)
+        groups = [
+            (f"battery-{index:02d}", size, (size, size, size))
+            for index, size in enumerate(sizes)
+        ]
+
+        selected = _select_battery_group_subset(
+            groups,
+            target=1_000,
+            test_minimums=(20, 20, 40),
+            main_minimums=(380, 380, 760),
+            modality="CT",
+        )
+
+        self.assertEqual(selected, {"battery-00", "battery-01", "battery-02"})
+
+    def test_split_keeps_crossed_capability_frontier(self) -> None:
+        groups = [
+            ("0", 5, (2, 1)),
+            ("1", 5, (1, 2)),
+            ("2", 3, (3, 3)),
+            ("3", 5, (0, 4)),
+        ]
+
+        selected = _select_battery_group_subset(
+            groups,
+            target=13,
+            test_minimums=(3, 1),
+            main_minimums=(1, 2),
+            modality="CT",
+        )
+
+        self.assertEqual(selected, {"0", "2", "3"})
 
 
 class ConfigHashTests(unittest.TestCase):

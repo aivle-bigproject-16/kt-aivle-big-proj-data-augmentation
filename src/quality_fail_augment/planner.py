@@ -808,6 +808,120 @@ def _case_assignments(config: dict[str, Any], modality: str) -> list[str]:
     return cases
 
 
+def _select_battery_group_subset(
+    groups: list[tuple[str, int, tuple[int, ...]]],
+    *,
+    target: int,
+    test_minimums: tuple[int, ...],
+    main_minimums: tuple[int, ...],
+    modality: str,
+) -> set[str]:
+    """Select whole battery groups while preserving case capacity on both sides.
+
+    Each capability tuple contains the number of eligible sources in the group.
+    Unlike the old v2.0 protection step, this DP never pins a battery merely
+    because one of its images is useful to main.  It instead constrains the
+    selected test capacity from below and from above (the latter leaves the
+    requested residual capacity for main).
+    """
+    if len(test_minimums) != len(main_minimums):
+        raise ValueError("battery-group capability dimensions do not match")
+    dimensions = len(test_minimums)
+    if any(len(capabilities) != dimensions for _, _, capabilities in groups):
+        raise ValueError("battery-group capability dimensions do not match")
+    totals = tuple(
+        sum(capabilities[index] for _, _, capabilities in groups)
+        for index in range(dimensions)
+    )
+    test_maximums = tuple(
+        totals[index] - main_minimums[index] for index in range(dimensions)
+    )
+    if any(
+        maximum < minimum
+        for minimum, maximum in zip(test_minimums, test_maximums, strict=True)
+    ):
+        raise ValueError(
+            f"{modality} does not have enough eligible sources to satisfy "
+            "test and main failure-case quotas"
+        )
+
+    zero_capabilities = (0,) * dimensions
+    Record = tuple[tuple[str, ...], tuple[int, ...]]
+
+    def add_to_frontier(frontier: list[Record], candidate: Record) -> None:
+        candidate_ids, candidate_capabilities = candidate
+        for existing_ids, existing_capabilities in frontier:
+            if all(
+                existing_capabilities[index] <= candidate_capabilities[index]
+                for index in range(dimensions)
+            ):
+                if (
+                    existing_capabilities != candidate_capabilities
+                    or existing_ids <= candidate_ids
+                ):
+                    return
+        frontier[:] = [
+            (existing_ids, existing_capabilities)
+            for existing_ids, existing_capabilities in frontier
+            if not all(
+                candidate_capabilities[index] <= existing_capabilities[index]
+                for index in range(dimensions)
+            )
+            or (
+                candidate_capabilities == existing_capabilities
+                and existing_ids < candidate_ids
+            )
+        ]
+        frontier.append(candidate)
+
+    states: dict[tuple[int, tuple[int, ...]], list[Record]] = {
+        (0, zero_capabilities): [((), zero_capabilities)]
+    }
+    for battery_id, size, capabilities in groups:
+        additions: dict[tuple[int, tuple[int, ...]], list[Record]] = {}
+        for (count, _), records in list(states.items()):
+            for selected_ids, selected_capabilities in records:
+                next_count = count + size
+                if next_count > target:
+                    continue
+                next_capabilities = tuple(
+                    selected_capabilities[index] + capabilities[index]
+                    for index in range(dimensions)
+                )
+                if any(
+                    value > test_maximums[index]
+                    for index, value in enumerate(next_capabilities)
+                ):
+                    continue
+                capped = tuple(
+                    min(next_capabilities[index], test_minimums[index])
+                    for index in range(dimensions)
+                )
+                key = (next_count, capped)
+                add_to_frontier(
+                    additions.setdefault(key, []),
+                    (selected_ids + (battery_id,), next_capabilities),
+                )
+        for key, candidates in additions.items():
+            frontier = states.setdefault(key, [])
+            for candidate in candidates:
+                add_to_frontier(frontier, candidate)
+        feasible = [
+            selected_ids
+            for (count, _), records in states.items()
+            for selected_ids, capabilities in records
+            if count == target
+            and all(capabilities[index] >= test_minimums[index] for index in range(dimensions))
+        ]
+        if feasible:
+            return set(min(feasible))
+
+    raise ValueError(
+        f"{modality} battery-group split has no exact {target}-image subset "
+        "that preserves failure-case capacity in both test and main"
+    )
+
+
 def _fingerprint(candidates: list[Candidate], raw_root: Path) -> str:
     digest = hashlib.sha256()
     for candidate in sorted(
@@ -1013,35 +1127,26 @@ def create_plan(
                 case: int(total_count) - int(test_case_quotas.get(case, 0))
                 for case, total_count in config["ct_failure_case_quotas"].items()
             }
+            # These slots were filled through has_dense_anchor() during source
+            # selection above. Reuse that proof instead of decoding all 20,000
+            # selected CT images a second time for partition capacity checks.
+            dense_eligible_indices = {
+                index
+                for index, case in case_by_index.items()
+                if case == "ct_beam_hardening_metal_streak"
+            }
+            logger.info(
+                "CT source selection complete | selected %s | guaranteed dense %s",
+                f"{len(chosen):,}",
+                f"{len(dense_eligible_indices):,}",
+            )
             # A battery is the leakage boundary for CT. Select complete battery
             # groups totaling the requested test size, then assign FAIL cases
             # inside each partition so both leakage and per-case quotas hold.
             groups: dict[str, list[int]] = {}
             for index, candidate in enumerate(chosen):
                 groups.setdefault(candidate.parsed.battery_id, []).append(index)
-            # The initial eligibility-aware assignment gives us distinct,
-            # qualified sources for every case. Pin enough special-case battery
-            # groups to main before solving the test subset so test selection
-            # cannot consume sources needed for main's 380/case quotas.
-            protected_main_battery_ids: set[str] = set()
-            for protected_case in (
-                "ct_cell_alignment_failure",
-                "ct_beam_hardening_metal_streak",
-            ):
-                needed = int(main_case_quotas.get(protected_case, 0))
-                protected_indices = [
-                    index
-                    for index, case in sorted(case_by_index.items())
-                    if case == protected_case
-                ][:needed]
-                protected_main_battery_ids.update(
-                    chosen[index].parsed.battery_id for index in protected_indices
-                )
-            group_items = [
-                item
-                for item in sorted(groups.items())
-                if item[0] not in protected_main_battery_ids
-            ]
+            group_items = sorted(groups.items())
             _pcg64_shuffle(
                 group_items, stable_seed(config["seed"], modality, "test-battery-groups")
             )
@@ -1051,37 +1156,44 @@ def create_plan(
             dense_needed = int(
                 test_case_quotas.get("ct_beam_hardening_metal_streak", 0)
             )
-            states: dict[tuple[int, int, int], tuple[str, ...]] = {
-                (0, 0, 0): ()
-            }
+            ct_group_capacities = []
             for battery_id, indices in group_items:
-                group_outline = sum(
+                outline = [
                     bool(chosen[index].has_battery_outline) for index in indices
-                )
-                group_dense = sum(has_dense_anchor(chosen[index]) for index in indices)
-                additions: dict[tuple[int, int, int], tuple[str, ...]] = {}
-                for (count, outline, dense), selected_ids in states.items():
-                    next_key = (
-                        count + len(indices),
-                        min(outline_needed, outline + group_outline),
-                        min(dense_needed, dense + group_dense),
+                ]
+                dense = [index in dense_eligible_indices for index in indices]
+                ct_group_capacities.append(
+                    (
+                        battery_id,
+                        len(indices),
+                        (
+                            sum(outline),
+                            sum(dense),
+                            sum(a or d for a, d in zip(outline, dense, strict=True)),
+                        ),
                     )
-                    if (
-                        next_key[0] <= test_target
-                        and next_key not in states
-                        and next_key not in additions
-                    ):
-                        additions[next_key] = selected_ids + (battery_id,)
-                states.update(additions)
-            target_state = (test_target, outline_needed, dense_needed)
-            if target_state not in states:
-                raise ValueError(
-                    "CT battery-group split cannot exactly satisfy test targets "
-                    f"(total={test_target}, alignment-eligible={outline_needed}, "
-                    f"dense-anchor-eligible={dense_needed}); "
-                    "adjust targets or provide more distinct battery IDs"
                 )
-            test_battery_ids = set(states[target_state])
+            test_battery_ids = _select_battery_group_subset(
+                ct_group_capacities,
+                target=test_target,
+                test_minimums=(
+                    outline_needed,
+                    dense_needed,
+                    outline_needed + dense_needed,
+                ),
+                main_minimums=(
+                    int(main_case_quotas.get("ct_cell_alignment_failure", 0)),
+                    int(main_case_quotas.get("ct_beam_hardening_metal_streak", 0)),
+                    int(main_case_quotas.get("ct_cell_alignment_failure", 0))
+                    + int(main_case_quotas.get("ct_beam_hardening_metal_streak", 0)),
+                ),
+                modality="CT",
+            )
+            logger.info(
+                "CT battery-group split complete | test images %s | test batteries %s",
+                f"{test_target:,}",
+                f"{len(test_battery_ids):,}",
+            )
             test_indices = {
                 index
                 for index, candidate in enumerate(chosen)
@@ -1102,37 +1214,62 @@ def create_plan(
                 )
                 remaining = list(order)
                 assigned: dict[int, str] = {}
-                priority = (
-                    "ct_cell_alignment_failure",
-                    "ct_beam_hardening_metal_streak",
+                alignment_needed = int(
+                    quotas.get("ct_cell_alignment_failure", 0)
                 )
-                cases_in_order = list(priority) + [
-                    case for case in quotas if case not in priority
+                alignment_order = [
+                    index
+                    for index in remaining
+                    if chosen[index].has_battery_outline
+                    and index not in dense_eligible_indices
+                ] + [
+                    index
+                    for index in remaining
+                    if chosen[index].has_battery_outline
+                    and index in dense_eligible_indices
+                ]
+                if len(alignment_order) < alignment_needed:
+                    raise ValueError(
+                        f"CT {scope} cannot fill ct_cell_alignment_failure quota "
+                        f"({alignment_needed}) with eligible sources"
+                    )
+                for index in alignment_order[:alignment_needed]:
+                    assigned[index] = "ct_cell_alignment_failure"
+                    remaining.remove(index)
+
+                dense_needed_here = int(
+                    quotas.get("ct_beam_hardening_metal_streak", 0)
+                )
+                dense_order = [
+                    index for index in remaining if index in dense_eligible_indices
+                ]
+                if len(dense_order) < dense_needed_here:
+                    raise ValueError(
+                        f"CT {scope} cannot fill ct_beam_hardening_metal_streak "
+                        f"quota ({dense_needed_here}) with eligible sources"
+                    )
+                for index in dense_order[:dense_needed_here]:
+                    assigned[index] = "ct_beam_hardening_metal_streak"
+                    remaining.remove(index)
+
+                cases_in_order = [
+                    case
+                    for case in quotas
+                    if case
+                    not in {
+                        "ct_cell_alignment_failure",
+                        "ct_beam_hardening_metal_streak",
+                    }
                 ]
                 for case in cases_in_order:
                     needed = int(quotas.get(case, 0))
                     for _ in range(needed):
-                        position = next(
-                            (
-                                position
-                                for position, index in enumerate(remaining)
-                                if (
-                                    case != "ct_cell_alignment_failure"
-                                    or chosen[index].has_battery_outline
-                                )
-                                and (
-                                    case != "ct_beam_hardening_metal_streak"
-                                    or has_dense_anchor(chosen[index])
-                                )
-                            ),
-                            -1,
-                        )
-                        if position < 0:
+                        if not remaining:
                             raise ValueError(
                                 f"CT {scope} cannot fill {case} quota ({needed}) "
                                 "with eligible sources"
                             )
-                        assigned[remaining.pop(position)] = case
+                        assigned[remaining.pop(0)] = case
                 return assigned
 
             main_indices = set(range(target)) - test_indices
@@ -1185,52 +1322,33 @@ def create_plan(
             groups: dict[str, list[int]] = {}
             for index, candidate in enumerate(chosen):
                 groups.setdefault(candidate.parsed.battery_id, []).append(index)
-            protected_glare_count = int(
-                main_case_quotas.get("rgb_reflection_glare", 0)
-            )
-            protected_main_battery_ids: set[str] = set()
-            protected_sources = 0
-            for index, case in sorted(case_by_index.items()):
-                if case != "rgb_reflection_glare":
-                    continue
-                protected_main_battery_ids.add(chosen[index].parsed.battery_id)
-                protected_sources += 1
-                if protected_sources >= protected_glare_count:
-                    break
-            group_items = [
-                item
-                for item in sorted(groups.items())
-                if item[0] not in protected_main_battery_ids
-            ]
+            group_items = sorted(groups.items())
             _pcg64_shuffle(
                 group_items, stable_seed(config["seed"], "RGB", "test-battery-groups")
             )
             glare_needed = int(test_case_quotas.get("rgb_reflection_glare", 0))
-            states: dict[tuple[int, int], tuple[str, ...]] = {(0, 0): ()}
-            for battery_id, indices in group_items:
-                group_glare_eligible = sum(
-                    bool(chosen[index].has_battery_outline) for index in indices
+            rgb_group_capacities = [
+                (
+                    battery_id,
+                    len(indices),
+                    (
+                        sum(
+                            bool(chosen[index].has_battery_outline)
+                            for index in indices
+                        ),
+                    ),
                 )
-                additions: dict[tuple[int, int], tuple[str, ...]] = {}
-                for (count, glare_eligible), selected_ids in states.items():
-                    next_key = (
-                        count + len(indices),
-                        min(glare_needed, glare_eligible + group_glare_eligible),
-                    )
-                    if (
-                        next_key[0] <= test_target
-                        and next_key not in states
-                        and next_key not in additions
-                    ):
-                        additions[next_key] = selected_ids + (battery_id,)
-                states.update(additions)
-            target_state = (test_target, glare_needed)
-            if target_state not in states:
-                raise ValueError(
-                    "RGB battery-group split cannot exactly satisfy test targets "
-                    f"(total={test_target}, glare-eligible={glare_needed})"
-                )
-            test_battery_ids = set(states[target_state])
+                for battery_id, indices in group_items
+            ]
+            test_battery_ids = _select_battery_group_subset(
+                rgb_group_capacities,
+                target=test_target,
+                test_minimums=(glare_needed,),
+                main_minimums=(
+                    int(main_case_quotas.get("rgb_reflection_glare", 0)),
+                ),
+                modality="RGB",
+            )
             test_indices = {
                 index
                 for index, candidate in enumerate(chosen)
