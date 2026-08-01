@@ -3,5 +3,6 @@ __pycache__/
 debug_*/
 .sample_staging/
 
-__pycache__/
-*.pyc
+.env
+.venv/
+.venv_*/
