@@ -43,6 +43,11 @@ CASE_NAMES_KO = {
     "rgb_hair_contamination": "렌즈·보호유리 섬유 오염",
 }
 SOURCE_REFERENCES = {case: f"v2.0:{case}" for case in (*CT_CASES, *RGB_CASES)}
+
+# How many defect components the widened glare search aims at when the narrow grid
+# finds no placement. Scattered defects are the failure mode this exists for, and
+# the largest few components carry almost all of the coverable area.
+GLARE_WIDE_ANCHOR_LIMIT = 4
 UNEVEN_TAIL_QUANTILE = 0.20
 UNEVEN_MIN_ASYMMETRY = 0.45
 UNEVEN_MAX_ASYMMETRY = 0.60
@@ -206,6 +211,49 @@ def _largest_connected_component(mask: np.ndarray) -> np.ndarray:
         ys, xs = zip(*best)
         output[np.asarray(ys), np.asarray(xs)] = True
     return output
+
+
+def _defect_anchors(mask: np.ndarray, limit: int) -> list[tuple[float, float]]:
+    """Return up to `limit` (x, y) aim points spread along the defect's own axis.
+
+    The glare search normally aims at the centroid of the whole defect mask. When
+    the defect is scattered across the cell that centroid can sit on no defect
+    pixel at all, so every candidate misses it. Splitting the defect pixels into
+    equal-count bands along their major axis and taking each band's medoid gives
+    aim points that are always on the mask and that cover the spread. Connected
+    component labelling would be the textbook choice, but it costs far more than
+    it buys here: the search only needs somewhere plausible to point at.
+    """
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return []
+    points = np.stack([xs, ys], axis=1).astype(np.float64)
+    centre = points.mean(axis=0)
+    centred = points - centre
+    if len(points) > 1:
+        _, vectors = np.linalg.eigh(np.cov(centred.T))
+        axis = vectors[:, -1]
+    else:
+        axis = np.asarray([1.0, 0.0])
+    projection = centred @ axis
+    edges = np.quantile(projection, np.linspace(0.0, 1.0, limit + 1))
+    anchors: list[tuple[float, float]] = []
+    for index in range(limit):
+        low, high = edges[index], edges[index + 1]
+        selected = (
+            (projection >= low) & (projection <= high)
+            if index == limit - 1
+            else (projection >= low) & (projection < high)
+        )
+        if not selected.any():
+            continue
+        band = points[selected]
+        band_centre = band.mean(axis=0)
+        nearest = band[np.argmin(((band - band_centre) ** 2).sum(axis=1))]
+        anchor = (float(nearest[0]), float(nearest[1]))
+        if anchor not in anchors:
+            anchors.append(anchor)
+    return anchors
 
 
 def _mask_points(mask: Image.Image | None) -> list[tuple[int, int]]:
@@ -1104,6 +1152,78 @@ def _rgb_case(
             axes.extend(
                 [defect_axis, np.asarray([-defect_axis[1], defect_axis[0]])]
             )
+        def consider_candidate(
+            axis: np.ndarray,
+            half_length: float,
+            width: int,
+            patch_count: int,
+            anchor: tuple[float, float],
+            spacing_factor: float = 1.8,
+        ) -> None:
+            """Rasterize one candidate and keep it when it clears the gate contract."""
+            nonlocal best_candidate
+            anchor_x, anchor_y = anchor
+            candidate_alpha = Image.new("L", result.size, 0)
+            candidate_draw = ImageDraw.Draw(candidate_alpha)
+            candidate_patches: list[dict[str, Any]] = []
+            for patch_index in range(patch_count):
+                offset = (
+                    (patch_index - (patch_count - 1) / 2.0)
+                    * max(width * spacing_factor, 2.0)
+                )
+                cx = float(anchor_x - axis[1] * offset)
+                cy = float(anchor_y + axis[0] * offset)
+                start = (
+                    cx - axis[0] * half_length,
+                    cy - axis[1] * half_length,
+                )
+                end = (
+                    cx + axis[0] * half_length,
+                    cy + axis[1] * half_length,
+                )
+                alpha = min(
+                    math.floor(255 * 0.78),
+                    max(
+                        math.ceil(255 * 0.70),
+                        round(255 * rng.uniform(0.70, 0.78)),
+                    ),
+                )
+                candidate_draw.line((start, end), fill=alpha, width=width)
+                candidate_patches.append(
+                    {
+                        "center": [round(cx, 3), round(cy, 3)],
+                        "axis": axis.tolist(),
+                        "half_length": half_length,
+                        "width": width,
+                        "alpha": alpha / 255,
+                    }
+                )
+            candidate_array = np.asarray(candidate_alpha).copy()
+            candidate_array[~object_array] = 0
+            core = candidate_array > 0
+            core_ratio = float(core.sum() / object_area)
+            defect_coverage = float(
+                (core & defect_array).sum() / max(defect_area, 1)
+            )
+            valid_defect = (
+                not defect_points
+                or minimum_defect_coverage <= defect_coverage <= 0.70
+            )
+            if 0.045 <= core_ratio <= 0.12 and valid_defect:
+                score = abs(core_ratio - 0.075)
+                if defect_points:
+                    score += abs(defect_coverage - 0.55)
+                clipped_alpha = Image.fromarray(candidate_array, mode="L")
+                candidate = (
+                    score,
+                    clipped_alpha,
+                    candidate_patches,
+                    core_ratio,
+                    defect_coverage,
+                )
+                if best_candidate is None or score < best_candidate[0]:
+                    best_candidate = candidate
+
         for axis in axes:
             for length_factor in length_factors:
                 half_length = max(2.0, major_extent * length_factor / 2.0)
@@ -1115,66 +1235,128 @@ def _rgb_case(
                     width = max(1, round(estimated_width * width_factor))
                     if (2.0 * half_length) / width < 5.0:
                         continue
-                    candidate_alpha = Image.new("L", result.size, 0)
-                    candidate_draw = ImageDraw.Draw(candidate_alpha)
-                    candidate_patches: list[dict[str, Any]] = []
-                    for patch_index in range(count):
-                        offset = (
-                            (patch_index - (count - 1) / 2.0)
-                            * max(width * 1.8, 2.0)
-                        )
-                        cx = float(base_x - axis[1] * offset)
-                        cy = float(base_y + axis[0] * offset)
-                        start = (
-                            cx - axis[0] * half_length,
-                            cy - axis[1] * half_length,
-                        )
-                        end = (
-                            cx + axis[0] * half_length,
-                            cy + axis[1] * half_length,
-                        )
-                        alpha = min(
-                            math.floor(255 * 0.78),
-                            max(
-                                math.ceil(255 * 0.70),
-                                round(255 * rng.uniform(0.70, 0.78)),
-                            ),
-                        )
-                        candidate_draw.line((start, end), fill=alpha, width=width)
-                        candidate_patches.append(
-                            {
-                                "center": [round(cx, 3), round(cy, 3)],
-                                "axis": axis.tolist(),
-                                "half_length": half_length,
-                                "width": width,
-                                "alpha": alpha / 255,
-                            }
-                        )
-                    candidate_array = np.asarray(candidate_alpha).copy()
-                    candidate_array[~object_array] = 0
-                    core = candidate_array > 0
-                    core_ratio = float(core.sum() / object_area)
-                    defect_coverage = float(
-                        (core & defect_array).sum() / max(defect_area, 1)
-                    )
-                    valid_defect = (
-                        not defect_points
-                        or minimum_defect_coverage <= defect_coverage <= 0.70
-                    )
-                    if 0.045 <= core_ratio <= 0.12 and valid_defect:
-                        score = abs(core_ratio - 0.075)
-                        if defect_points:
-                            score += abs(defect_coverage - 0.55)
-                        clipped_alpha = Image.fromarray(candidate_array, mode="L")
-                        candidate = (
-                            score,
-                            clipped_alpha,
-                            candidate_patches,
-                            core_ratio,
-                            defect_coverage,
-                        )
-                        if best_candidate is None or score < best_candidate[0]:
-                            best_candidate = candidate
+                    consider_candidate(axis, half_length, width, count, (base_x, base_y))
+
+        if best_candidate is None:
+            # The narrow grid above assumes the defect sits in one clump under the
+            # cell's major axis. Scattered defects fail it every time, and retrying
+            # cannot help because the grid never consumes the seed that varies
+            # between attempts. Widen the search instead of giving up: aim at each
+            # defect component in turn, and allow shorter, thinner and fewer strokes
+            # so the stroke stays inside a narrow cylindrical cell after clipping.
+            # The gate thresholds are untouched, so an accepted candidate here meets
+            # exactly the same contract as one from the narrow grid.
+            # The parameter gate downstream requires exactly two patches, so patch
+            # count is not a lever here. What is a lever is how far apart they sit:
+            # the narrow grid spaces them by 1.8 widths, which for a thin stroke
+            # puts them shoulder to shoulder and behaves like one thicker stroke.
+            # Spreading them lets the pair straddle a scattered defect.
+            wide_length_factors = (0.22, 0.32, 0.44, 0.60, 0.80)
+            wide_width_factors = (0.7, 0.9, 1.1, 1.4, 1.8)
+            wide_spacing_factors = (1.8, 6.0, 14.0)
+            wide_counts = (2,)
+            anchors = (
+                _defect_anchors(defect_array, GLARE_WIDE_ANCHOR_LIMIT)
+                if defect_points
+                else []
+            )
+            if not anchors:
+                anchors = [(base_x, base_y)]
+            # Scoring only needs to know which pixels the stroke covers, not how
+            # bright it is, so the sweep runs on a binary canvas cropped to the cell.
+            # A full-frame RGBA rasterization per candidate made this grid cost tens
+            # of seconds per source. The winner is re-rendered through
+            # consider_candidate below so the accepted candidate is produced by
+            # exactly the same code as the narrow grid.
+            rows_any = np.any(object_array, axis=1)
+            cols_any = np.any(object_array, axis=0)
+            top, bottom = int(np.argmax(rows_any)), int(len(rows_any) - np.argmax(rows_any[::-1]))
+            left, right = int(np.argmax(cols_any)), int(len(cols_any) - np.argmax(cols_any[::-1]))
+            object_crop = object_array[top:bottom, left:right]
+            defect_crop = defect_array[top:bottom, left:right]
+            crop_size = (right - left, bottom - top)
+            probe_alpha = Image.new("1", crop_size, 0)
+            probe_draw = ImageDraw.Draw(probe_alpha)
+            best_wide: (
+                tuple[float, float, int, int, tuple[float, float], np.ndarray, float]
+                | None
+            ) = None
+
+            for anchor in anchors:
+                anchor_x, anchor_y = anchor
+                for axis in axes:
+                    for length_factor in wide_length_factors:
+                        half_length = max(2.0, major_extent * length_factor / 2.0)
+                        for patch_count in wide_counts:
+                            estimated_width = max(
+                                1.0,
+                                target_area / max(patch_count * 2.0 * half_length, 1.0),
+                            )
+                            for width_factor in wide_width_factors:
+                                width = max(1, round(estimated_width * width_factor))
+                                if (2.0 * half_length) / width < 5.0:
+                                    continue
+                                # Clipping to the cell only removes area, so a stroke
+                                # that is already too small unclipped can never reach
+                                # the 4.5% floor. Skipping it here avoids rasterizing
+                                # most of this much larger grid.
+                                if (
+                                    patch_count * 2.0 * half_length * width
+                                ) / object_area < 0.045:
+                                    continue
+                                for spacing_factor in wide_spacing_factors:
+                                    probe_draw.rectangle((0, 0) + crop_size, fill=0)
+                                    for patch_index in range(patch_count):
+                                        offset = (
+                                            (patch_index - (patch_count - 1) / 2.0)
+                                            * max(width * spacing_factor, 2.0)
+                                        )
+                                        cx = float(anchor_x - axis[1] * offset) - left
+                                        cy = float(anchor_y + axis[0] * offset) - top
+                                        probe_draw.line(
+                                            (
+                                                (
+                                                    cx - axis[0] * half_length,
+                                                    cy - axis[1] * half_length,
+                                                ),
+                                                (
+                                                    cx + axis[0] * half_length,
+                                                    cy + axis[1] * half_length,
+                                                ),
+                                            ),
+                                            fill=1,
+                                            width=width,
+                                        )
+                                    core = np.asarray(probe_alpha) & object_crop
+                                    core_ratio = float(core.sum() / object_area)
+                                    if not 0.045 <= core_ratio <= 0.12:
+                                        continue
+                                    coverage = float(
+                                        (core & defect_crop).sum() / max(defect_area, 1)
+                                    )
+                                    if defect_points and not (
+                                        minimum_defect_coverage <= coverage <= 0.70
+                                    ):
+                                        continue
+                                    score = abs(core_ratio - 0.075)
+                                    if defect_points:
+                                        score += abs(coverage - 0.55)
+                                    if best_wide is None or score < best_wide[0]:
+                                        best_wide = (
+                                            score,
+                                            half_length,
+                                            width,
+                                            patch_count,
+                                            anchor,
+                                            axis,
+                                            spacing_factor,
+                                        )
+            if best_wide is not None:
+                _, half_length, width, patch_count, anchor, axis, spacing_factor = best_wide
+                consider_candidate(
+                    axis, half_length, width, patch_count, anchor, spacing_factor
+                )
+
         if best_candidate is None:
             raise ValueError("glare_no_gate_safe_geometry")
         _, glare_alpha, patches, core_object_ratio, defect_coverage = best_candidate
