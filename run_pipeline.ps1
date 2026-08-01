@@ -36,18 +36,35 @@
   단계마다 <Output>\pipeline.status 에 시작과 종료를 기록한다. 마지막 줄이
   finished ... exit=0 이면 정상 완료다.
 
+  ## 경로 설정(.env)
+
+  -RawRoot·-Config·-Plan·-Output 을 생략하면 저장소 루트의 `.env` 값을 쓴다.
+  `.env.example` 을 `.env` 로 복사해 자기 머신 경로로 고쳐두면 아래처럼 단계 이름만
+  주고 실행할 수 있다. 인자를 명시하면 그쪽이 항상 이긴다.
+
+      QFA_RAW_ROOT    -RawRoot
+      QFA_CONFIG      -Config
+      QFA_PLAN_CSV    -Plan   (없으면 QFA_PLAN_DIR\manifests\generation_plan.csv)
+      QFA_PLAN_DIR    -Output (plan 단계)
+      QFA_SMOKE_DIR   -Output (smoke 단계)
+      QFA_OUTPUT_DIR  -Output (generate·resume·verify·upload 단계)
+
   ## 사용 예
 
-      pwsh -File .\run_pipeline.ps1 -Stage plan     -RawRoot "..." -Config .\config.40k.json -Output "D:\qf_plan" -Detached
-      pwsh -File .\run_pipeline.ps1 -Stage smoke    -RawRoot "..." -Config .\config.40k.json -Plan "D:\qf_plan\manifests\generation_plan.csv" -Output "D:\qf_smoke" -Detached
-      pwsh -File .\run_pipeline.ps1 -Stage generate -RawRoot "..." -Config .\config.measured.json -Plan "D:\qf_plan\manifests\generation_plan.csv" -Output "D:\qf_full" -Detached
-      pwsh -File .\run_pipeline.ps1 -Stage resume   -RawRoot "..." -Config .\config.measured.json -Plan "D:\qf_plan\manifests\generation_plan.csv" -Output "D:\qf_full" -Detached
-      pwsh -File .\run_pipeline.ps1 -Stage verify   -Output "D:\qf_full"
-      pwsh -File .\run_pipeline.ps1 -Stage upload   -Output "D:\qf_full" -Detached
+      pwsh -File .\run_pipeline.ps1 -Stage plan     -Detached
+      pwsh -File .\run_pipeline.ps1 -Stage smoke    -TrustPlan -Detached
+      pwsh -File .\run_pipeline.ps1 -Stage generate -TrustPlan -Detached
+      pwsh -File .\run_pipeline.ps1 -Stage resume   -TrustPlan -Detached
+      pwsh -File .\run_pipeline.ps1 -Stage verify
+      pwsh -File .\run_pipeline.ps1 -Stage upload   -Detached
+
+  경로를 직접 주고 싶을 때:
+
+      pwsh -File .\run_pipeline.ps1 -Stage plan -RawRoot "..." -Config .\config.40k.json -Output "D:\qf_plan" -Detached
 
   계획 재작성이 필요할 때(quota·seed 등 계획에 영향을 주는 config 변경):
 
-      pwsh -File .\run_pipeline.ps1 -Stage plan -RawRoot "..." -Config .\config.40k.v2.json `
+      pwsh -File .\run_pipeline.ps1 -Stage plan -Config .\config.40k.v2.json `
         -ReuseScan "D:\qf_plan\manifests\scan_cache.csv" -Output "D:\qf_plan_v2" -Detached
 #>
 param(
@@ -72,6 +89,51 @@ $DefaultRemoteRoot = "gdrive:AIVLE_BigProject/data_augmentation"
 
 $ErrorActionPreference = "Stop"
 
+# 버전 확인을 가장 먼저 한다. 아래 .env 읽기와 인자 전달이 모두 한글 경로를 다루므로,
+# 5.1에서는 분리 실행으로 넘어가기 전에 멈춰야 한다.
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    Write-Error "pwsh(PowerShell 7) 필요. Windows PowerShell 5.1은 BOM 없는 UTF-8 한글을 깨뜨린다."
+    exit 2
+}
+
+# 생략된 경로 인자는 저장소 루트 .env 에서 채운다. 명시한 인자가 항상 우선한다.
+# 값 형식은 src/quality_fail_augment/settings.py 와 같다.
+$envFile = Join-Path $PSScriptRoot ".env"
+if (Test-Path -LiteralPath $envFile) {
+    $envValues = @{}
+    foreach ($line in (Get-Content -LiteralPath $envFile -Encoding UTF8)) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith("#")) { continue }
+        $split = $trimmed.IndexOf("=")
+        if ($split -lt 1) { continue }
+        $key = $trimmed.Substring(0, $split).Trim()
+        $value = $trimmed.Substring($split + 1).Trim()
+        if ($value.Length -ge 2 -and $value[0] -eq $value[-1] -and ($value[0] -eq '"' -or $value[0] -eq "'")) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        $envValues[$key] = $value
+    }
+    if (-not $RawRoot -and $envValues["QFA_RAW_ROOT"]) { $RawRoot = $envValues["QFA_RAW_ROOT"] }
+    if (-not $Config -and $envValues["QFA_CONFIG"]) { $Config = $envValues["QFA_CONFIG"] }
+    if (-not $Plan) {
+        if ($envValues["QFA_PLAN_CSV"]) {
+            $Plan = $envValues["QFA_PLAN_CSV"]
+        } elseif ($envValues["QFA_PLAN_DIR"]) {
+            $Plan = Join-Path $envValues["QFA_PLAN_DIR"] "manifests\generation_plan.csv"
+        }
+    }
+    if (-not $Output) {
+        # 단계마다 기본 출력 폴더가 다르다. plan 은 계획, smoke 는 시험 생성,
+        # 나머지는 본 생성 산출물을 가리킨다.
+        $outputKey = switch ($Stage) {
+            "plan"  { "QFA_PLAN_DIR" }
+            "smoke" { "QFA_SMOKE_DIR" }
+            default { "QFA_OUTPUT_DIR" }
+        }
+        if ($envValues[$outputKey]) { $Output = $envValues[$outputKey] }
+    }
+}
+
 # 긴 단계는 호출 세션의 자식이 되면 안 된다. -Detached 로 독립 프로세스로 다시 띄운다.
 # Start-Process -ArgumentList 는 공백을 포함한 배열 원소를 인용하지 않고 공백으로 이어
 # 붙이므로, 공백을 가질 수 있는 값은 모두 이중 인용해서 넘긴다.
@@ -90,11 +152,6 @@ if ($Detached) {
     Write-Host "$Stage 를 분리 실행으로 시작했다. PID $($child.Id)" -ForegroundColor Cyan
     if ($Output) { Write-Host "진행 상황: $Output-pipeline\pipeline.status" -ForegroundColor Cyan }
     exit 0
-}
-
-if ($PSVersionTable.PSVersion.Major -lt 7) {
-    Write-Error "pwsh(PowerShell 7) 필요. Windows PowerShell 5.1은 BOM 없는 UTF-8 한글을 깨뜨린다."
-    exit 2
 }
 
 Set-Location -Path $PSScriptRoot

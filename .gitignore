@@ -6,3 +6,6 @@ debug_*/
 .env
 .venv/
 .venv_*/
+
+# smoke 가 실측해 만드는 config. worker_peak_rss_bytes 는 머신마다 다르다.
+*.measured.json

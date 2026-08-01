@@ -65,30 +65,57 @@ plan 생성 직전에 다음 교집합을 검사하며 하나라도 발견되면
 
 - Windows 10/11
 - Python 3.10 이상
+- PowerShell 7 (`pwsh`). Windows PowerShell 5.1은 BOM 없는 UTF-8 한글 경로를 깨뜨린다.
 - 충분한 출력 디스크 공간
-- 원본 데이터: `E:\103.배터리 불량 이미지 데이터`
-
-프로젝트에서 검증한 가상환경:
-
-```text
-C:\Users\User\Documents\Codex\rgb-augmentation-venv
-```
+- 원본 데이터 폴더 하나. 그 폴더 바로 아래에 `3.개방데이터`가 있어야 한다.
 
 ## 설치
 
-PowerShell에서 저장소 폴더로 이동한다.
+저장소 폴더에서 가상환경을 만들고 패키지를 설치한다. 전역 Python에 설치하면
+numpy·Pillow 버전이 고정 핀으로 덮여 다른 작업이 깨지므로 반드시 가상환경을 쓴다.
 
 ```powershell
-Set-Location -LiteralPath "C:\Users\User\Documents\Codex\2026-07-22\aivle-bigproject-16-kt-aivle-big\work\kt-aivle-big-proj-data-augmentation-v1.9-severe"
+py -3.12 -m venv .venv
 
-& "C:\Users\User\Documents\Codex\rgb-augmentation-venv\Scripts\python.exe" `
-  -m pip install -e .
-
-& "C:\Users\User\Documents\Codex\rgb-augmentation-venv\Scripts\python.exe" `
-  -m quality_fail_augment.cli --version
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m quality_fail_augment.cli --version
 ```
 
 버전 출력은 `2.0`이어야 한다.
+
+## 경로 설정 (`.env`)
+
+원본 데이터와 출력 폴더 위치는 머신마다 다르다. 매번 CLI 인자로 적는 대신
+저장소 루트의 `.env`에 한 번 적어둔다. `.env`는 git에 올라가지 않는다.
+
+```powershell
+Copy-Item .env.example .env
+```
+
+복사한 `.env`를 자기 경로로 고친다.
+
+```ini
+QFA_RAW_ROOT=C:\Users\rudtn\Downloads\빅프로젝트_데이터\데이터 전처리\103.배터리 불량 이미지 데이터
+QFA_CONFIG=./config.40k.json
+QFA_PLAN_DIR=C:\...\quality-fail-v2-plan
+QFA_OUTPUT_DIR=C:\...\quality-fail-v2-output
+QFA_SMOKE_DIR=C:\...\quality-fail-v2-smoke
+QFA_AUDIT_DIR=C:\...\quality-fail-v2-audit
+```
+
+| 변수 | 채우는 인자 |
+|---|---|
+| `QFA_RAW_ROOT` | `--raw-root` |
+| `QFA_CONFIG` | `--config` |
+| `QFA_PLAN_DIR` | `plan`의 `--output` |
+| `QFA_SMOKE_DIR` | smoke 생성의 `--output` |
+| `QFA_OUTPUT_DIR` | `generate`·`verify`의 `--output` |
+| `QFA_AUDIT_DIR` | `audit-raw`의 `--output` |
+| `QFA_PLAN_CSV` | `--plan`. 생략하면 `QFA_PLAN_DIR\manifests\generation_plan.csv` |
+
+값에는 이스케이프 처리를 하지 않으므로 Windows 경로의 백슬래시를 그대로 적으면 된다.
+우선순위는 CLI 인자, 셸 환경변수, `.env` 순이다. 다른 `.env`를 쓰려면
+`--env-file` 인자나 `QFA_ENV_FILE` 환경변수를 준다.
 
 ## 내장 scan cache
 
@@ -126,24 +153,21 @@ cache/scan_cache.csv
 
 ## 실행 방법
 
-아래 명령은 저장소 루트에서 실행한다.
+아래 명령은 저장소 루트에서 실행하며, 경로는 모두 `.env`에서 온다.
+`.env` 값 대신 다른 경로를 쓰고 싶으면 해당 인자를 직접 주면 된다.
 
 ### 1. plan 생성
 
 plan 출력 폴더는 새 폴더이거나 비어 있어야 한다.
 
 ```powershell
-& "C:\Users\User\Documents\Codex\rgb-augmentation-venv\Scripts\python.exe" `
-  -m quality_fail_augment.cli plan `
-  --raw-root "E:\103.배터리 불량 이미지 데이터" `
-  --config ".\config.40k.json" `
-  --output "E:\quality-fail-v2-plan"
+.\.venv\Scripts\python.exe -m quality_fail_augment.cli plan
 ```
 
 주요 출력:
 
 ```text
-E:\quality-fail-v2-plan\
+<QFA_PLAN_DIR>\
 ├─ plan_metadata.json
 ├─ logs\
 └─ manifests\
@@ -165,14 +189,11 @@ E:\quality-fail-v2-plan\
 ### 2. 소량 smoke 생성
 
 본 생성 전에 모달리티별 100장을 만들어 환경과 메모리를 확인한다.
+smoke는 출력 폴더가 다르므로 `--output`만 직접 준다.
 
 ```powershell
-& "C:\Users\User\Documents\Codex\rgb-augmentation-venv\Scripts\python.exe" `
-  -m quality_fail_augment.cli generate `
-  --raw-root "E:\103.배터리 불량 이미지 데이터" `
-  --config ".\config.40k.json" `
-  --plan "E:\quality-fail-v2-plan\manifests\generation_plan.csv" `
-  --output "E:\quality-fail-v2-smoke" `
+.\.venv\Scripts\python.exe -m quality_fail_augment.cli generate `
+  --output $env:QFA_SMOKE_DIR `
   --limit-per-modality 100 `
   --trust-plan
 ```
@@ -182,26 +203,13 @@ E:\quality-fail-v2-plan\
 출력 폴더는 존재하지 않거나 비어 있어야 한다.
 
 ```powershell
-& "C:\Users\User\Documents\Codex\rgb-augmentation-venv\Scripts\python.exe" `
-  -m quality_fail_augment.cli generate `
-  --raw-root "E:\103.배터리 불량 이미지 데이터" `
-  --config ".\config.40k.json" `
-  --plan "E:\quality-fail-v2-plan\manifests\generation_plan.csv" `
-  --output "E:\quality-fail-v2-output" `
-  --trust-plan
+.\.venv\Scripts\python.exe -m quality_fail_augment.cli generate --trust-plan
 ```
 
 ### 4. 중단된 생성 재개
 
 ```powershell
-& "C:\Users\User\Documents\Codex\rgb-augmentation-venv\Scripts\python.exe" `
-  -m quality_fail_augment.cli generate `
-  --raw-root "E:\103.배터리 불량 이미지 데이터" `
-  --config ".\config.40k.json" `
-  --plan "E:\quality-fail-v2-plan\manifests\generation_plan.csv" `
-  --output "E:\quality-fail-v2-output" `
-  --resume `
-  --trust-plan
+.\.venv\Scripts\python.exe -m quality_fail_augment.cli generate --resume --trust-plan
 ```
 
 이미 manifest에 정상 커밋된 `synthetic_id`는 건너뛰고 나머지만 생성한다.
@@ -209,15 +217,24 @@ E:\quality-fail-v2-plan\
 ### 5. 결과 검증
 
 ```powershell
-& "C:\Users\User\Documents\Codex\rgb-augmentation-venv\Scripts\python.exe" `
-  -m quality_fail_augment.cli verify `
-  --output "E:\quality-fail-v2-output"
+.\.venv\Scripts\python.exe -m quality_fail_augment.cli verify
+```
+
+### run_pipeline.ps1
+
+`run_pipeline.ps1`도 같은 `.env`를 읽는다. 로그·상태 기록과 분리 실행(`-Detached`)이
+필요하면 이쪽을 쓴다.
+
+```powershell
+pwsh -File .\run_pipeline.ps1 -Stage plan -Detached
+pwsh -File .\run_pipeline.ps1 -Stage generate -TrustPlan -Detached
+pwsh -File .\run_pipeline.ps1 -Stage verify
 ```
 
 ## 주요 산출물
 
 ```text
-E:\quality-fail-v2-output\
+<QFA_OUTPUT_DIR>\
 ├─ CT\
 │  ├─ main\
 │  └─ test\
@@ -251,11 +268,10 @@ failure case 하나를 기록한 augmentation JSON을 갖는다.
 ```powershell
 $env:PYTHONPATH = (Resolve-Path ".\src").Path
 
-& "C:\Users\User\Documents\Codex\rgb-augmentation-venv\Scripts\python.exe" `
-  -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-현재 전체 테스트 38개가 통과한다.
+현재 전체 테스트 48개가 통과한다.
 
 ## Git LFS와 v2.0 브랜치 push
 
@@ -293,5 +309,7 @@ https://github.com/aivle-bigproject-16/kt-aivle-big-proj-data-augmentation.git
 - `src/quality_fail_augment/preprocessing/stages.py`: 전처리와 좌표 변환
 - `src/quality_fail_augment/generator.py`: 병렬 생성, 재개, reserve 교체, 검증과 ZIP 생성
 - `src/quality_fail_augment/cli.py`: `audit-raw`, `plan`, `generate`, `verify` 진입점
+- `src/quality_fail_augment/settings.py`: `.env` 로딩과 경로 기본값 해석
 - `config.40k.json`: v2.0 수량, case 쿼터, seed 및 출력 설정
+- `.env.example`: 경로 설정 템플릿. `.env`로 복사해 쓴다
 - `cache/scan_cache.csv`: 내장 v3 scan cache
