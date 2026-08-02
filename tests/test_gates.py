@@ -422,6 +422,7 @@ class FailureCaseTests(unittest.TestCase):
                         f"{case} variant {variant_index} exhausted retries: "
                         f"{last_error}"
                     )
+
                 baseline = np.asarray(image.convert("L"), dtype=np.float32)
                 output = np.asarray(result.image.convert("L"), dtype=np.float32)
                 region = np.asarray(object_mask) > 0
@@ -465,6 +466,36 @@ class FailureCaseTests(unittest.TestCase):
                         - parameters["baseline_asymmetry"],
                         0.15,
                     )
+
+    def test_glare_fallback_keeps_the_same_strength_gate_on_a_narrow_outline(self) -> None:
+        image = Image.new("RGB", (120, 240), (30, 40, 50))
+        ImageDraw.Draw(image).rectangle((56, 5, 64, 235), fill=(130, 160, 190))
+        object_mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(object_mask).rectangle((56, 5, 64, 235), fill=255)
+        defect_mask = Image.new("L", image.size, 0)
+        # Deliberately extend the annotation outside the battery outline.  Recorded gate
+        # measurements must describe the visible, outline-clipped glare only.
+        ImageDraw.Draw(defect_mask).rectangle((50, 20, 70, 43), fill=255)
+
+        result = apply_failure_case(
+            image,
+            "RGB",
+            "rgb_reflection_glare",
+            123,
+            object_mask=object_mask,
+            defect_mask=defect_mask,
+        )
+
+        parameters = result.records[0]["parameters"]
+        self.assertEqual(len(parameters["patches"]), 2)
+        self.assertEqual(parameters["outline_overlap_ratio"], 1.0)
+        self.assertGreaterEqual(parameters["core_object_area_ratio"], 0.045)
+        self.assertLessEqual(parameters["core_object_area_ratio"], 0.12)
+        self.assertGreaterEqual(
+            parameters["defect_coverage_ratio"],
+            parameters["minimum_defect_coverage_ratio"],
+        )
+        self.assertLessEqual(parameters["defect_coverage_ratio"], 0.70)
 
     def test_focus_gate_is_measured_in_final_512_pixel_space(self) -> None:
         image = Image.new("RGB", (1920, 1080), (45, 70, 95))

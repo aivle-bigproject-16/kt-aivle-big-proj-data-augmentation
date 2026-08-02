@@ -52,6 +52,12 @@ def parser() -> argparse.ArgumentParser:
     make.add_argument("--limit-per-modality", type=int)
     make.add_argument("--resume", action="store_true")
     make.add_argument(
+        "--fast-resume",
+        action="store_true",
+        help="With --resume, use one augmentation attempt per missing ID; intended for "
+        "recovering a completed run's recorded failures",
+    )
+    make.add_argument(
         "--trust-plan",
         action="store_true",
         help="Skip the full raw re-scan and fingerprint recheck; still verifies each "
@@ -87,7 +93,17 @@ def main() -> None:
             args.reuse_scan.resolve() if args.reuse_scan else None,
         )
     elif args.command == "generate":
-        result = generate(args.raw_root.resolve(), _config(args.config), args.plan.resolve(), args.output.resolve(), args.limit_per_modality, args.resume, args.trust_plan, args.drop_cases)
+        result = generate(
+            args.raw_root.resolve(),
+            _config(args.config),
+            args.plan.resolve(),
+            args.output.resolve(),
+            args.limit_per_modality,
+            args.resume,
+            args.trust_plan,
+            args.drop_cases,
+            args.fast_resume,
+        )
     else:
         verify_dataset(args.output.resolve())
         result = {"verified": True}

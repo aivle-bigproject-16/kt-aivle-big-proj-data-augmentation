@@ -1040,6 +1040,7 @@ def _rgb_case(
             if defect_mask is not None and defect_mask.getbbox() is not None
             else np.zeros(object_array.shape, dtype=bool)
         )
+        defect_array &= object_array
         if eligible:
             eligible_array = np.asarray(eligible, dtype=np.float64)
             centroid_x, centroid_y = eligible_array[:, 0].mean(), eligible_array[:, 1].mean()
@@ -1066,7 +1067,8 @@ def _rgb_case(
             major_axis = np.array([0.0, 1.0])
             major_extent = result.height * 0.6
             highlight_points = []
-        defect_points = _mask_points(defect_mask)
+        defect_y, defect_x = np.where(defect_array)
+        defect_points = list(zip(defect_x.tolist(), defect_y.tolist()))
         object_area = max(int(object_array.sum()), 1)
         defect_area = int(defect_array.sum())
         defect_object_ratio = defect_area / object_area
@@ -1176,7 +1178,82 @@ def _rgb_case(
                         if best_candidate is None or score < best_candidate[0]:
                             best_candidate = candidate
         if best_candidate is None:
-            raise ValueError("glare_no_gate_safe_geometry")
+            # Narrow/irregular outlines can clip every rasterized width candidate even though
+            # the v1.9 contract itself is feasible.  Build the same two elongated highlights
+            # directly inside the object mask, targeting 9% core coverage and the existing
+            # defect-overlap bounds.  Alpha, bloom and all quality-gate ranges stay unchanged.
+            target_count = max(1, min(object_area, round(0.09 * object_area)))
+            selected = np.zeros(object_array.shape, dtype=bool)
+            axis = np.asarray(major_axis, dtype=np.float32)
+            perpendicular = np.asarray([-axis[1], axis[0]])
+            yy_all, xx_all = np.ogrid[0 : result.height, 0 : result.width]
+            centred_x = xx_all.astype(np.float32) - np.float32(base_x)
+            centred_y = yy_all.astype(np.float32) - np.float32(base_y)
+            along = centred_x * axis[0] + centred_y * axis[1]
+            across = centred_x * perpendicular[0] + centred_y * perpendicular[1]
+            band_offset = max(2.0, math.sqrt(target_count) * 0.18)
+            band_score = np.minimum(
+                np.abs(across - band_offset), np.abs(across + band_offset)
+            ) + np.maximum(np.abs(along) - major_extent * 0.45, 0.0)
+
+            if defect_area:
+                minimum_pixels = math.ceil(minimum_defect_coverage * defect_area)
+                desired_pixels = min(
+                    math.floor(0.55 * defect_area),
+                    math.floor(0.70 * defect_area),
+                    target_count,
+                )
+                desired_pixels = min(
+                    target_count, max(minimum_pixels, desired_pixels)
+                )
+                defect_indices = np.flatnonzero(defect_array)
+                defect_order = defect_indices[
+                    np.argsort(band_score.ravel()[defect_indices], kind="stable")
+                ]
+                selected.ravel()[defect_order[:desired_pixels]] = True
+
+            remaining_count = target_count - int(selected.sum())
+            if remaining_count > 0:
+                available = object_array & ~selected
+                available_indices = np.flatnonzero(available)
+                available_order = available_indices[
+                    np.argsort(band_score.ravel()[available_indices], kind="stable")
+                ]
+                selected.ravel()[available_order[:remaining_count]] = True
+
+            alpha = min(
+                math.floor(255 * 0.78),
+                max(math.ceil(255 * 0.70), round(255 * rng.uniform(0.70, 0.78))),
+            )
+            candidate_array = np.zeros(object_array.shape, dtype=np.uint8)
+            candidate_array[selected] = alpha
+            core_ratio = float(selected.sum() / object_area)
+            defect_coverage = float(
+                (selected & defect_array).sum() / max(defect_area, 1)
+            )
+            estimated_width = max(
+                1, round(target_count / max(2.0 * 2.0 * major_extent * 0.45, 1.0))
+            )
+            fallback_patches = [
+                {
+                    "center": [
+                        round(float(base_x + perpendicular[0] * offset), 3),
+                        round(float(base_y + perpendicular[1] * offset), 3),
+                    ],
+                    "axis": axis.tolist(),
+                    "half_length": major_extent * 0.45,
+                    "width": estimated_width,
+                    "alpha": alpha / 255,
+                }
+                for offset in (-band_offset, band_offset)
+            ]
+            best_candidate = (
+                abs(core_ratio - 0.075),
+                Image.fromarray(candidate_array, mode="L"),
+                fallback_patches,
+                core_ratio,
+                defect_coverage,
+            )
         _, glare_alpha, patches, core_object_ratio, defect_coverage = best_candidate
         radius_final = rng.uniform(10, 14)
         radius = radius_final * max(result.size) / 512.0

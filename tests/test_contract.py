@@ -284,6 +284,99 @@ class PublicContractTests(unittest.TestCase):
             ).read_text(encoding="utf-8-sig")
             self.assertIn("uncommitted.jpg", recovery)
 
+    def test_resume_rebuilds_only_the_missing_manifest_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw, plan_dir, output = root / "raw", root / "plan", root / "output"
+            _write_raw(raw)
+            config = _config()
+            create_plan(raw, config, plan_dir)
+            generate(
+                raw,
+                config,
+                plan_dir / "manifests" / "generation_plan.csv",
+                output,
+            )
+            manifest_path = output / "manifests" / "dataset_manifest.csv"
+            lineage_path = output / "manifests" / "lineage_private.csv"
+
+            def remove_last_row(path: Path) -> tuple[str, list[dict[str, str]]]:
+                with path.open(encoding="utf-8-sig", newline="") as handle:
+                    reader = csv.DictReader(handle)
+                    fields = list(reader.fieldnames or [])
+                    rows = list(reader)
+                missing_id = rows[-1]["synthetic_id"]
+                with path.open("w", encoding="utf-8-sig", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=fields)
+                    writer.writeheader()
+                    writer.writerows(rows[:-1])
+                return missing_id, rows[:-1]
+
+            missing_id, kept = remove_last_row(manifest_path)
+            lineage_missing_id, _ = remove_last_row(lineage_path)
+            self.assertEqual(lineage_missing_id, missing_id)
+            preserved_path = output / kept[0]["image_path"]
+            preserved_bytes = preserved_path.read_bytes()
+
+            resumed = generate(
+                raw,
+                config,
+                plan_dir / "manifests" / "generation_plan.csv",
+                output,
+                resume=True,
+                trust_plan=True,
+                fast_resume=True,
+            )
+
+            self.assertEqual(sum(resumed["counts"].values()), 8)
+            self.assertEqual(preserved_path.read_bytes(), preserved_bytes)
+            with manifest_path.open(encoding="utf-8-sig", newline="") as handle:
+                ids = [row["synthetic_id"] for row in csv.DictReader(handle)]
+            self.assertEqual(ids.count(missing_id), 1)
+            generation_log = (output / "logs" / "generation.log").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(
+                "resume 원본 해시 검증 축소 | 전체 8 | 검증 1 | 완료 생략 7",
+                generation_log,
+            )
+            self.assertIn(
+                "fast resume 활성화 | 미완료 1 | augmentation retry 1",
+                generation_log,
+            )
+
+    def test_resume_rejects_incomplete_private_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw, plan_dir, output = root / "raw", root / "plan", root / "output"
+            _write_raw(raw)
+            config = _config()
+            create_plan(raw, config, plan_dir)
+            generate(
+                raw,
+                config,
+                plan_dir / "manifests" / "generation_plan.csv",
+                output,
+            )
+            lineage_path = output / "manifests" / "lineage_private.csv"
+            with lineage_path.open(encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                fields = list(reader.fieldnames or [])
+                rows = list(reader)
+            with lineage_path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows[:-1])
+
+            with self.assertRaisesRegex(ValueError, "complete private lineage"):
+                generate(
+                    raw,
+                    config,
+                    plan_dir / "manifests" / "generation_plan.csv",
+                    output,
+                    resume=True,
+                )
+
     def test_resume_stops_when_committed_file_hash_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

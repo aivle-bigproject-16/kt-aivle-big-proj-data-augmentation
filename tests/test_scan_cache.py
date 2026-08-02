@@ -10,6 +10,11 @@ from pathlib import Path
 
 from PIL import Image
 
+from quality_fail_augment.generator import (
+    _cached_pixel_hashes_for_paths,
+    _iter_replacement_candidates,
+    _partition_by_original_battery,
+)
 from quality_fail_augment.planner import (
     PERFORMANCE_ONLY_KEYS,
     SCAN_CACHE_FIELDS,
@@ -28,6 +33,175 @@ from test_contract import _config, _write_raw
 def _cache_rows(path: Path) -> dict[str, dict[str, str]]:
     with path.open(encoding="utf-8-sig", newline="") as handle:
         return {row["image_stem"]: row for row in csv.DictReader(handle)}
+
+
+class ReplacementCandidateTests(unittest.TestCase):
+    def test_legacy_reserve_is_enriched_with_cache_pixel_hash(self) -> None:
+        partitions = {("RGB", "1"): "main"}
+        reserve = {
+            "modality": "RGB",
+            "reserve_rank": "1",
+            "raw_split": "training",
+            "source_stem": "RGB_cell_cylindrical_1_2",
+            "raw_image_path": "reserve.png",
+            "raw_json_path": "reserve.json",
+            "image_sha256": "image",
+            "json_sha256": "json",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "scan_cache.csv"
+            fields = [
+                "status",
+                "modality",
+                "raw_split",
+                "image_stem",
+                "raw_image_path",
+                "raw_json_path",
+                "image_sha256",
+                "json_sha256",
+                "pixel_hash",
+                "has_battery_outline",
+            ]
+            with cache_path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "status": "valid",
+                        "modality": "RGB",
+                        "raw_split": "training",
+                        "image_stem": "RGB_cell_cylindrical_1_2",
+                        "raw_image_path": "reserve.png",
+                        "raw_json_path": "reserve.json",
+                        "image_sha256": "image",
+                        "json_sha256": "json",
+                        "pixel_hash": "pixels",
+                        "has_battery_outline": "true",
+                    }
+                )
+
+            candidates = list(
+                _iter_replacement_candidates(
+                    [reserve],
+                    cache_path,
+                    "RGB",
+                    "main",
+                    "rgb_reflection_glare",
+                    partitions,
+                )
+            )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["pixel_hash"], "pixels")
+
+    def test_cached_pixel_hashes_preserve_content_uniqueness_without_rehashing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "scan_cache.csv"
+            with cache_path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=["raw_image_path", "pixel_hash"]
+                )
+                writer.writeheader()
+                writer.writerows(
+                    [
+                        {"raw_image_path": "used.png", "pixel_hash": "pixels-a"},
+                        {"raw_image_path": "other.png", "pixel_hash": "pixels-b"},
+                    ]
+                )
+
+            hashes = _cached_pixel_hashes_for_paths(cache_path, {"USED.PNG"})
+
+        self.assertEqual(hashes, {"pixels-a"})
+
+    def test_cached_replacements_stay_in_the_same_battery_partition(self) -> None:
+        plan_rows = [
+            {"modality": "RGB", "original_battery_id": "1", "partition": "main"},
+            {"modality": "RGB", "original_battery_id": "2", "partition": "test"},
+        ]
+        partitions = _partition_by_original_battery(plan_rows)
+        fields = [
+            "status",
+            "modality",
+            "raw_split",
+            "image_stem",
+            "raw_image_path",
+            "raw_json_path",
+            "image_sha256",
+            "json_sha256",
+            "has_battery_outline",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "scan_cache.csv"
+            with cache_path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(
+                    [
+                        {
+                            "status": "valid",
+                            "modality": "RGB",
+                            "raw_split": "training",
+                            "image_stem": "RGB_cell_cylindrical_1_2",
+                            "raw_image_path": "main.png",
+                            "raw_json_path": "main.json",
+                            "image_sha256": "image-main",
+                            "json_sha256": "json-main",
+                            "has_battery_outline": "true",
+                        },
+                        {
+                            "status": "valid",
+                            "modality": "RGB",
+                            "raw_split": "validation",
+                            "image_stem": "RGB_cell_cylindrical_2_2",
+                            "raw_image_path": "test.png",
+                            "raw_json_path": "test.json",
+                            "image_sha256": "image-test",
+                            "json_sha256": "json-test",
+                            "has_battery_outline": "true",
+                        },
+                        {
+                            "status": "valid",
+                            "modality": "RGB",
+                            "raw_split": "training",
+                            "image_stem": "RGB_cell_cylindrical_1_3",
+                            "raw_image_path": "main-no-outline.png",
+                            "raw_json_path": "main-no-outline.json",
+                            "image_sha256": "image-no-outline",
+                            "json_sha256": "json-no-outline",
+                            "has_battery_outline": "false",
+                        },
+                    ]
+                )
+
+            candidates = list(
+                _iter_replacement_candidates(
+                    [],
+                    cache_path,
+                    "RGB",
+                    "main",
+                    "rgb_reflection_glare",
+                    partitions,
+                )
+            )
+
+        self.assertEqual([row["raw_image_path"] for row in candidates], ["main.png"])
+
+    def test_plan_rejects_a_battery_assigned_to_both_partitions(self) -> None:
+        with self.assertRaisesRegex(ValueError, "leaks an original battery"):
+            _partition_by_original_battery(
+                [
+                    {
+                        "modality": "RGB",
+                        "original_battery_id": "1",
+                        "partition": "main",
+                    },
+                    {
+                        "modality": "RGB",
+                        "original_battery_id": "1",
+                        "partition": "test",
+                    },
+                ]
+            )
 
 
 class BatteryGroupSplitTests(unittest.TestCase):

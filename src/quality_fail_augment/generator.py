@@ -104,6 +104,147 @@ def _read_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def _partition_by_original_battery(
+    rows: list[dict[str, str]],
+) -> dict[tuple[str, str], str]:
+    """Return the frozen main/test partition for every selected battery group."""
+    result: dict[tuple[str, str], str] = {}
+    for row in rows:
+        key = (row["modality"], str(row["original_battery_id"]))
+        partition = row["partition"]
+        previous = result.setdefault(key, partition)
+        if previous != partition:
+            raise ValueError(
+                "Plan leaks an original battery across main/test: "
+                f"{row['modality']} {row['original_battery_id']}"
+            )
+    return result
+
+
+def _iter_replacement_candidates(
+    reserve_rows: list[dict[str, str]],
+    scan_cache_path: Path | None,
+    modality: str,
+    partition: str,
+    failure_case: str,
+    partition_by_battery: dict[tuple[str, str], str],
+    preferred_battery_ids: set[str] | None = None,
+):
+    """Yield unused-source candidates without changing the frozen augmentation contract.
+
+    The plan's small reserve list is tried first.  The scan cache then supplies additional
+    candidates from battery groups already assigned to the same output partition, preserving
+    the main/test battery-ID boundary while avoiding another raw-directory scan.
+    """
+    seen_paths: set[str] = set()
+
+    def normalize(row: dict[str, str], stem_field: str) -> dict[str, str] | None:
+        if row.get("modality") != modality:
+            return None
+        if (
+            failure_case == "rgb_reflection_glare"
+            and "has_battery_outline" in row
+            and row.get("has_battery_outline", "").casefold() != "true"
+        ):
+            return None
+        stem = row.get(stem_field, "")
+        parsed = ParsedName.parse(stem)
+        if parsed is None:
+            return None
+        if partition_by_battery.get((modality, str(parsed.battery_id))) != partition:
+            return None
+        raw_image_path = row.get("raw_image_path", "")
+        raw_json_path = row.get("raw_json_path", "")
+        if not raw_image_path or not raw_json_path:
+            return None
+        path_key = raw_image_path.casefold()
+        if path_key in seen_paths:
+            return None
+        seen_paths.add(path_key)
+        return {
+            "modality": modality,
+            "raw_split": row.get("raw_split", ""),
+            "raw_image_path": raw_image_path,
+            "raw_json_path": raw_json_path,
+            "source_stem": stem,
+            "image_sha256": row.get("image_sha256", ""),
+            "json_sha256": row.get("json_sha256", ""),
+            "pixel_hash": row.get("pixel_hash", ""),
+            "partition": partition,
+            "original_battery_id": str(parsed.battery_id),
+        }
+
+    for reserve in sorted(reserve_rows, key=lambda row: int(row.get("reserve_rank", 0))):
+        # Existing v2.0 reserve manifests predate pixel_hash.  When the scan cache is
+        # available, let its full row yield this path later so content-level duplicate
+        # prevention cannot be bypassed by a reserve-first entry.
+        if scan_cache_path is not None and scan_cache_path.is_file() and not reserve.get(
+            "pixel_hash"
+        ):
+            continue
+        candidate = normalize(reserve, "source_stem")
+        if candidate is not None:
+            yield candidate
+
+    if scan_cache_path is None or not scan_cache_path.is_file():
+        return
+    # Cache rows are path-sorted and adjacent frames often have nearly identical masks.  Walk
+    # deterministic hash buckets instead of that clustered order so a gate-incompatible run of
+    # frames cannot starve replacement.  This changes source choice only; augmentation parameters
+    # and quality gates remain frozen.
+    bucket_count = 8
+    preferred = preferred_battery_ids or set()
+    preference_passes = (True, False) if preferred else (False,)
+    for preferred_only in preference_passes:
+        for bucket in range(bucket_count):
+            with scan_cache_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                for cached in csv.DictReader(handle):
+                    if cached.get("status") != "valid":
+                        continue
+                    path_hash = hashlib.sha256(
+                        (
+                            failure_case
+                            + "\0"
+                            + cached.get("raw_image_path", "")
+                        ).encode("utf-8")
+                    ).digest()
+                    if int.from_bytes(path_hash[:4], "big") % bucket_count != bucket:
+                        continue
+                    candidate = normalize(cached, "image_stem")
+                    if candidate is None:
+                        continue
+                    in_preferred = candidate["original_battery_id"] in preferred
+                    if in_preferred == preferred_only:
+                        yield candidate
+
+
+def _cached_pixel_hashes_for_paths(
+    scan_cache_path: Path, raw_image_paths: set[str]
+) -> set[str]:
+    """Recover cached pixel identities for sources committed by an earlier run."""
+    pending = {path.casefold() for path in raw_image_paths if path}
+    if not pending:
+        return set()
+    hashes: set[str] = set()
+    with scan_cache_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            path_key = row.get("raw_image_path", "").casefold()
+            if path_key not in pending:
+                continue
+            value = row.get("pixel_hash", "")
+            if value:
+                hashes.add(value)
+            pending.remove(path_key)
+            if not pending:
+                break
+    if pending:
+        raise ValueError(
+            "scan cache is missing previously committed replacement sources: "
+            f"{len(pending)}"
+        )
+    return hashes
+
+
 def _write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> None:
     output = io.StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
@@ -171,6 +312,7 @@ def _validate_plan(
     config: dict[str, Any],
     rows: list[dict[str, str]],
     trust_plan: bool = False,
+    source_rows: list[dict[str, str]] | None = None,
 ) -> None:
     if not rows:
         raise ValueError("Plan is empty")
@@ -182,7 +324,7 @@ def _validate_plan(
     image_ids = [(row["modality"], row["new_image_id"]) for row in rows]
     if len(ids) != len(set(ids)) or len(image_ids) != len(set(image_ids)):
         raise ValueError("Plan contains duplicate synthetic/image IDs")
-    for row in rows:
+    for row in rows if source_rows is None else source_rows:
         image_path = _safe_source(raw_root, row["raw_image_path"])
         json_path = _safe_source(raw_root, row["raw_json_path"])
         if not image_path.is_file() or not json_path.is_file():
@@ -539,15 +681,46 @@ def generate(
     resume: bool = False,
     trust_plan: bool = False,
     drop_cases: set[str] | None = None,
+    fast_resume: bool = False,
 ) -> dict[str, Any]:
     if output.exists() and any(output.iterdir()) and not resume:
         raise ValueError(f"Output directory is not empty: {output}")
     if drop_cases and not resume:
         raise ValueError("--drop-cases requires --resume")
+    if fast_resume and not resume:
+        raise ValueError("--fast-resume requires --resume")
     output.mkdir(parents=True, exist_ok=True)
     logger = configure_logger("quality_fail_augment.generate", output / "logs" / "generation.log")
     rows = _read_csv(plan_path)
-    _validate_plan(raw_root, config, rows, trust_plan)
+    prior_manifest_path = output / "manifests" / "dataset_manifest.csv"
+    prior_manifest_rows = (
+        _read_csv(prior_manifest_path)
+        if resume and prior_manifest_path.exists()
+        else []
+    )
+    completed_ids_for_hash_skip = {
+        row["synthetic_id"]
+        for row in prior_manifest_rows
+        if not drop_cases or row.get("failure_case", "") not in drop_cases
+    }
+    source_rows_to_validate = None
+    if resume and trust_plan:
+        source_rows_to_validate = [
+            row for row in rows if row["synthetic_id"] not in completed_ids_for_hash_skip
+        ]
+        logger.info(
+            "resume 원본 해시 검증 축소 | 전체 %d | 검증 %d | 완료 생략 %d",
+            len(rows),
+            len(source_rows_to_validate),
+            len(rows) - len(source_rows_to_validate),
+        )
+    _validate_plan(
+        raw_root,
+        config,
+        rows,
+        trust_plan,
+        source_rows=source_rows_to_validate,
+    )
     # Publish the frozen planning contract and audit beside the generated dataset.
     output_manifests = output / "manifests"
     output_manifests.mkdir(parents=True, exist_ok=True)
@@ -560,18 +733,8 @@ def generate(
         shutil.copy2(plan_log, output / "logs" / "plan.log")
     reserve_path = plan_path.parent / "reserve_sources.csv"
     reserve_rows = _read_csv(reserve_path) if reserve_path.exists() else []
-    reserve_queues = {
-        modality: iter(
-            sorted(
-                [row for row in reserve_rows if row.get("modality") == modality],
-                key=lambda row: int(row.get("reserve_rank", 0)),
-            )
-        )
-        for modality in ("CT", "RGB")
-    }
-    consumed_source_keys = {
-        (row["raw_split"].casefold(), row["source_stem"].casefold()) for row in rows
-    }
+    partition_by_battery = _partition_by_original_battery(rows)
+    scan_cache_path = plan_path.parent / "scan_cache.csv"
     selected = list(rows)
     if limit_per_modality is not None:
         limited: list[dict[str, str]] = []
@@ -608,7 +771,86 @@ def generate(
     if resume:
         _cleanup_uncommitted(output, manifest_rows)
     existing = {row["synthetic_id"] for row in manifest_rows}
+    lineage_by_id = {row["synthetic_id"]: row for row in lineage_rows}
+    if resume:
+        missing_lineage = existing - set(lineage_by_id)
+        if missing_lineage:
+            example = sorted(missing_lineage)[0]
+            raise ValueError(
+                "Resume requires complete private lineage to prevent source reuse; "
+                f"missing {len(missing_lineage)} rows (example: {example})"
+            )
+    consumed_source_paths = {
+        row["raw_image_path"].casefold() for row in rows if row.get("raw_image_path")
+    }
+    # A resumed run must not reuse reserve sources committed by the previous run.  The public
+    # manifest intentionally omits private raw paths, so recover them from private lineage.
+    consumed_source_paths.update(
+        row["raw_image_path"].casefold()
+        for row in lineage_rows
+        if row.get("raw_image_path")
+    )
+    consumed_pixel_hashes = {
+        row["pixel_hash"] for row in rows if row.get("pixel_hash")
+    }
+    planned_source_paths = {
+        row["raw_image_path"].casefold() for row in rows if row.get("raw_image_path")
+    }
+    committed_replacement_paths = {
+        row["raw_image_path"]
+        for row in lineage_rows
+        if row.get("raw_image_path", "").casefold() not in planned_source_paths
+    }
+    if committed_replacement_paths:
+        if not scan_cache_path.is_file():
+            raise ValueError(
+                "scan cache is required to prevent pixel-duplicate replacement reuse"
+            )
+        consumed_pixel_hashes.update(
+            _cached_pixel_hashes_for_paths(
+                scan_cache_path, committed_replacement_paths
+            )
+        )
+    successful_batteries: dict[tuple[str, str, str], set[str]] = {}
+    for manifest in manifest_rows:
+        failure_case = manifest.get("failure_case", "")
+        lineage = lineage_by_id.get(manifest.get("synthetic_id", ""))
+        if not failure_case or lineage is None:
+            continue
+        key = (manifest["modality"], manifest["partition"], failure_case)
+        successful_batteries.setdefault(key, set()).add(
+            str(lineage["original_battery_id"])
+        )
+    replacement_keys = {
+        (row["modality"], row["partition"], row["failure_case"])
+        for row in rows
+        if row.get("failure_case")
+    }
+    replacement_queues = {
+        (modality, partition, failure_case): iter(
+            _iter_replacement_candidates(
+                reserve_rows,
+                scan_cache_path,
+                modality,
+                partition,
+                failure_case,
+                partition_by_battery,
+                successful_batteries.get((modality, partition, failure_case)),
+            )
+        )
+        for modality, partition, failure_case in replacement_keys
+    }
     tasks = [row for row in selected if row["synthetic_id"] not in existing]
+    fast_retry_ids = (
+        {row["synthetic_id"] for row in tasks}
+        if fast_resume
+        else set()
+    )
+    if fast_resume:
+        logger.info(
+            "fast resume 활성화 | 미완료 %d | augmentation retry 1",
+            len(fast_retry_ids),
+        )
     effective_jobs = _effective_jobs(config, len(tasks))
     checkpoint_interval = max(1, int(config.get("checkpoint_interval", 25)))
     chunk_size = max(
@@ -659,13 +901,19 @@ def generate(
         failed_row: dict[str, str], initial_error: Exception
     ) -> tuple[Any | None, Exception | None]:
         last_error: Exception = initial_error
-        queue = reserve_queues[failed_row["modality"]]
-        for reserve in queue:
-            source_key = (
-                reserve["raw_split"].casefold(),
-                reserve["source_stem"].casefold(),
+        queue = replacement_queues[
+            (
+                failed_row["modality"],
+                failed_row["partition"],
+                failed_row["failure_case"],
             )
-            if source_key in consumed_source_keys:
+        ]
+        for reserve in queue:
+            source_path_key = reserve["raw_image_path"].casefold()
+            if source_path_key in consumed_source_paths:
+                continue
+            replacement_pixel_hash = reserve.get("pixel_hash", "")
+            if replacement_pixel_hash and replacement_pixel_hash in consumed_pixel_hashes:
                 continue
             image_path = _safe_source(raw_root, reserve["raw_image_path"])
             json_path = _safe_source(raw_root, reserve["raw_json_path"])
@@ -700,11 +948,18 @@ def generate(
                 }
             )
             try:
+                replacement_config = (
+                    {**config, "max_augmentation_retries": 1}
+                    if failed_row["synthetic_id"] in fast_retry_ids
+                    else config
+                )
                 manifest, lineage = _make_one(
-                    str(raw_root), str(output), replacement, config
+                    str(raw_root), str(output), replacement, replacement_config
                 )
                 manifest["replacement_for"] = failed_row["raw_image_path"]
-                consumed_source_keys.add(source_key)
+                consumed_source_paths.add(source_path_key)
+                if replacement_pixel_hash:
+                    consumed_pixel_hashes.add(replacement_pixel_hash)
                 return (manifest, lineage), None
             except Exception as exc:
                 last_error = exc
@@ -745,8 +1000,13 @@ def generate(
 
     if effective_jobs <= 1:
         for row in tasks:
+            task_config = (
+                {**config, "max_augmentation_retries": 1}
+                if row["synthetic_id"] in fast_retry_ids
+                else config
+            )
             try:
-                consume(row, _make_one(str(raw_root), str(output), row, config))
+                consume(row, _make_one(str(raw_root), str(output), row, task_config))
             except Exception as exc:
                 consume(row, error=exc)
     else:
@@ -756,7 +1016,12 @@ def generate(
                 [str(raw_root)] * len(tasks),
                 [str(output)] * len(tasks),
                 tasks,
-                [config] * len(tasks),
+                [
+                    ({**config, "max_augmentation_retries": 1}
+                    if row["synthetic_id"] in fast_retry_ids
+                    else config)
+                    for row in tasks
+                ],
                 chunksize=chunk_size,
             )
             monitored_pids.update(

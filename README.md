@@ -132,6 +132,10 @@ cache/scan_cache.csv
 
 plan 출력 폴더는 새 폴더이거나 비어 있어야 한다.
 
+`generation_plan.csv`는 Git에 포함되지 않는다. 저장소를 clone한 컴퓨터마다 아래
+`plan` 명령을 먼저 실행해야 하며, Git LFS로 받은 `cache/scan_cache.csv`를 읽어
+`E:\quality-fail-v2-plan\manifests\generation_plan.csv`를 생성한다.
+
 ```powershell
 & "C:\Users\User\Documents\Codex\rgb-augmentation-venv\Scripts\python.exe" `
   -m quality_fail_augment.cli plan `
@@ -205,6 +209,31 @@ E:\quality-fail-v2-plan\
 ```
 
 이미 manifest에 정상 커밋된 `synthetic_id`는 건너뛰고 나머지만 생성한다.
+전체 실행 종료 시 `generation_errors.csv`에 실패가 기록된 경우에도 같은 명령을
+사용한다. 성공한 파일과 ID는 그대로 보존하고 실패하여 manifest에 없는 ID만 다시
+생성한다. 대체 원본은 같은 main/test battery 그룹의 미사용 원본만 사용하며 증강
+방법, 강도 범위 및 품질 gate는 변경하지 않는다.
+
+`--resume --trust-plan` 조합은 완료된 ID의 원본 SHA-256 재검증을 생략하고 미완료
+ID만 검증한다. 완료 결과 파일은 manifest 해시로 계속 검증한다. 빠른 실패 복구를
+원하면 `--fast-resume`을 추가한다. 이 옵션은 미완료 ID의 증강 시도를 1회로 제한하며,
+glare는 동일한 2개 반사 패치·알파·bloom·면적 gate 안에서 결정적 fallback을 사용한다.
+대체 원본은 기존 source path와 캐시 `pixel_hash`를 함께 비교하므로 경로만 다른 동일
+이미지도 재사용하지 않는다. 단순 중단 복구에는 `--fast-resume` 없이 실행하고, 전체
+실행 후 `generation_errors.csv`에 기록된 실패만 빠르게 복구할 때 사용한다.
+
+```powershell
+# 전체 실행이 끝난 뒤 실패 ID만 빠르게 복구
+& "C:\Users\User\Documents\Codex\rgb-augmentation-venv\Scripts\python.exe" `
+  -m quality_fail_augment.cli generate `
+  --raw-root "E:\103.배터리 불량 이미지 데이터" `
+  --config ".\config.40k.json" `
+  --plan "E:\quality-fail-v2-plan\manifests\generation_plan.csv" `
+  --output "E:\quality-fail-v2-output" `
+  --resume `
+  --fast-resume `
+  --trust-plan
+```
 
 ### 5. 결과 검증
 
