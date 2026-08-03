@@ -113,6 +113,11 @@ def _config_hash(config: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def config_hash(config: dict[str, Any]) -> str:
+    """Return the canonical hash for output-affecting planning configuration."""
+    return _config_hash(config)
+
+
 def _pcg64_shuffle(values: list[Any], seed: int) -> None:
     """Shuffle in place with the v2.0 canonical NumPy PCG64 generator."""
     if len(values) < 2:

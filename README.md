@@ -1,5 +1,8 @@
 # quality-fail-augment v2.0
 
+RGB test 1,000장만 별도로 생성하는 방법은
+[`docs/RGB_TESTSET.md`](docs/RGB_TESTSET.md)를 참고한다.
+
 CT/RGB 배터리 이미지를 사용해 PASS/FAIL 학습 데이터를 결정론적으로 생성하는
 증강 파이프라인이다. v2.0은 내장 scan cache를 사용하므로 plan 단계에서 원본 폴더
 전체 탐색, preflight, 전체 파일 stat 및 해시 계산을 수행하지 않는다.

@@ -8,6 +8,7 @@ from . import __version__
 from .augment import CT_CASES, RGB_CASES
 from .generator import generate, verify_dataset
 from .planner import audit_raw, create_plan
+from .rgb_testset import extract_rgb_testset
 
 
 def _config(path: Path) -> dict:
@@ -71,6 +72,31 @@ def parser() -> argparse.ArgumentParser:
         help="With --resume, forget the committed samples of these failure cases so they "
         "are regenerated after their augmentation parameters change",
     )
+    rgb_test = commands.add_parser(
+        "extract-rgb-test",
+        help="Generate a battery-disjoint RGB test set from an approved full plan",
+    )
+    rgb_test.add_argument("--raw-root", type=Path, required=True)
+    rgb_test.add_argument("--config", type=Path, required=True)
+    rgb_test.add_argument(
+        "--plan",
+        type=Path,
+        required=True,
+        help="Approved full generation_plan.csv containing RGB main/test assignments",
+    )
+    rgb_test.add_argument("--output", type=Path, required=True)
+    rgb_test.add_argument("--total", type=int, default=1000)
+    rgb_test.add_argument("--augmented", type=int, default=100)
+    rgb_test.add_argument(
+        "--resume",
+        action="store_true",
+        help="Keep completed RGB test samples and regenerate only missing/failed IDs",
+    )
+    rgb_test.add_argument(
+        "--trust-plan",
+        action="store_true",
+        help="Skip a full raw re-scan; selected source image/JSON hashes are still checked",
+    )
     check = commands.add_parser("verify", help="Verify an existing generated dataset")
     check.add_argument("--output", type=Path, required=True)
     return root
@@ -103,6 +129,17 @@ def main() -> None:
             args.trust_plan,
             args.drop_cases,
             args.fast_resume,
+        )
+    elif args.command == "extract-rgb-test":
+        result = extract_rgb_testset(
+            args.raw_root.resolve(),
+            _config(args.config),
+            args.plan.resolve(),
+            args.output.resolve(),
+            args.total,
+            args.augmented,
+            args.trust_plan,
+            args.resume,
         )
     else:
         verify_dataset(args.output.resolve())

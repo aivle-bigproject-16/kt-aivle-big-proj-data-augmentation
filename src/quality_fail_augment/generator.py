@@ -682,6 +682,9 @@ def generate(
     trust_plan: bool = False,
     drop_cases: set[str] | None = None,
     fast_resume: bool = False,
+    support_manifest_dir: Path | None = None,
+    blocked_source_paths: set[str] | None = None,
+    blocked_pixel_hashes: set[str] | None = None,
 ) -> dict[str, Any]:
     if output.exists() and any(output.iterdir()) and not resume:
         raise ValueError(f"Output directory is not empty: {output}")
@@ -731,10 +734,11 @@ def generate(
     if plan_log.is_file():
         (output / "logs").mkdir(parents=True, exist_ok=True)
         shutil.copy2(plan_log, output / "logs" / "plan.log")
-    reserve_path = plan_path.parent / "reserve_sources.csv"
+    support_dir = support_manifest_dir or plan_path.parent
+    reserve_path = support_dir / "reserve_sources.csv"
     reserve_rows = _read_csv(reserve_path) if reserve_path.exists() else []
     partition_by_battery = _partition_by_original_battery(rows)
-    scan_cache_path = plan_path.parent / "scan_cache.csv"
+    scan_cache_path = support_dir / "scan_cache.csv"
     selected = list(rows)
     if limit_per_modality is not None:
         limited: list[dict[str, str]] = []
@@ -783,6 +787,9 @@ def generate(
     consumed_source_paths = {
         row["raw_image_path"].casefold() for row in rows if row.get("raw_image_path")
     }
+    consumed_source_paths.update(
+        path.casefold() for path in (blocked_source_paths or set()) if path
+    )
     # A resumed run must not reuse reserve sources committed by the previous run.  The public
     # manifest intentionally omits private raw paths, so recover them from private lineage.
     consumed_source_paths.update(
@@ -793,6 +800,9 @@ def generate(
     consumed_pixel_hashes = {
         row["pixel_hash"] for row in rows if row.get("pixel_hash")
     }
+    consumed_pixel_hashes.update(
+        value for value in (blocked_pixel_hashes or set()) if value
+    )
     planned_source_paths = {
         row["raw_image_path"].casefold() for row in rows if row.get("raw_image_path")
     }
