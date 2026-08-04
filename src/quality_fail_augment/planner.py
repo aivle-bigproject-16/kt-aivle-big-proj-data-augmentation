@@ -24,7 +24,12 @@ from .common import (
     sha256_file,
     stable_seed,
 )
-from .geometry import extract_ct_roi, point_rings, porosity_bbox_metric
+from .geometry import (
+    extract_ct_roi,
+    point_rings,
+    porosity_bbox_metric,
+    repaired_polygons,
+)
 from .models import Candidate, IMAGE_SUFFIXES, ParsedName
 from .progress import ProgressReporter, configure_logger
 
@@ -108,8 +113,13 @@ def _config_hash(config: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def config_hash(config: dict[str, Any]) -> str:
+    """Return the canonical hash for output-affecting planning configuration."""
+    return _config_hash(config)
+
+
 def _pcg64_shuffle(values: list[Any], seed: int) -> None:
-    """Shuffle in place with the v1.7 canonical NumPy PCG64 generator."""
+    """Shuffle in place with the v2.0 canonical NumPy PCG64 generator."""
     if len(values) < 2:
         return
     order = np.random.Generator(np.random.PCG64(seed)).permutation(len(values))
@@ -119,7 +129,8 @@ def _pcg64_shuffle(values: list[Any], seed: int) -> None:
 # scan 캐시 스키마 버전. _validate_pair 가 쓰는 검증 로직 — open_normalized, pixel_hash,
 # point_rings, extract_ct_roi, porosity_bbox_metric, 필수 필드 목록 — 이 바뀌면 반드시
 # 올린다. 올리지 않으면 낡은 판정을 그대로 재사용하게 된다.
-SCAN_CACHE_VERSION = "2"
+SCAN_CACHE_VERSION = "3"
+EMBEDDED_SCAN_CACHE = Path(__file__).resolve().parents[2] / "cache" / "scan_cache.csv"
 
 SCAN_CACHE_FIELDS = [
     "cache_version",
@@ -394,9 +405,7 @@ def _validate_pair(
         if declared and Path(str(declared)).stem.casefold() != stem.casefold():
             raise ValueError(f"image_info.file_name stem mismatch: {declared}")
         outline = label.get("swelling", {}).get("battery_outline")
-        has_battery_outline = outline not in (None, [])
-        if outline not in (None, []):
-            point_rings(outline)
+        has_battery_outline = False
         defects = label.get("defects")
         if defects is not None and not isinstance(defects, list):
             raise ValueError(f"defects must be null or list, got {type(defects).__name__}")
@@ -407,6 +416,8 @@ def _validate_pair(
                 point_rings(defect.get("points"))
         image = open_normalized(image_path, modality)
         roi = extract_ct_roi(label, image.width, image.height) if modality == "CT" else None
+        outline_frame = roi if roi is not None else (0.0, 0.0, image.width, image.height)
+        has_battery_outline = bool(repaired_polygons(outline, outline_frame))
         ratio, component_count = porosity_bbox_metric(label, roi) if roi else (0.0, 0)
         image_hash = sha256_file(image_path, int(config.get("hash_chunk_bytes", 1_048_576)))
         json_hash = sha256_file(json_path, int(config.get("hash_chunk_bytes", 1_048_576)))
@@ -551,11 +562,28 @@ def scan(
     audit_checkpoint_path: Path | None = None,
     reuse_scan: Path | None = None,
     cache_path: Path | None = None,
+    cache_only: bool = False,
 ) -> tuple[list[Candidate], list[dict[str, Any]], list[str], list[dict[str, Any]]]:
-    groups, discovered = _index_raw(raw_root, logger)
-    _preflight(raw_root, groups, config)
-    sorted_groups = sorted(groups.items())
     cache = _load_scan_cache(reuse_scan) if reuse_scan else {}
+    if cache_only:
+        if not cache:
+            raise ValueError("cache-only planning requires a non-empty scan cache")
+        groups: dict[tuple[str, str, str], dict[str, list[Path]]] = {}
+        for key, entry in cache.items():
+            groups[key] = {
+                "images": [raw_root / Path(entry["raw_image_path"])],
+                "json": [raw_root / Path(entry["raw_json_path"])],
+            }
+        discovered = len(groups) * 2
+        if logger:
+            logger.info(
+                "내장 scan cache 전용 모드 | 폴더 탐색·preflight·전체 stat 생략 | pair %s",
+                f"{len(groups):,}",
+            )
+    else:
+        groups, discovered = _index_raw(raw_root, logger)
+        _preflight(raw_root, groups, config)
+    sorted_groups = sorted(groups.items())
     results_by_key: dict[
         tuple[str, str, str], tuple[Candidate | None, dict[str, Any], dict[str, Any]]
     ] = {}
@@ -567,7 +595,9 @@ def scan(
             image_path, json_path = group["images"][0], group["json"][0]
             stem = image_path.stem
             entry = cache.get(key)
-            if entry is not None and _cache_fresh(entry, image_path, json_path):
+            if entry is not None and (
+                cache_only or _cache_fresh(entry, image_path, json_path)
+            ):
                 results_by_key[key] = _result_from_cache(entry, image_path, json_path, config)
                 continue
             pair_keys.append(key)
@@ -752,6 +782,26 @@ def _validate_config(config: dict[str, Any]) -> None:
             raise ValueError(f"{modality.upper()} unknown failure cases: {sorted(unknown)}")
         if sum(int(value) for value in quotas.values()) != fail_target:
             raise ValueError(f"{modality.upper()} failure case quotas do not sum to {fail_target}")
+        test_quotas = config.get(f"{modality}_test_failure_case_quotas")
+        if test_quotas is not None:
+            if set(test_quotas) != set(quotas):
+                raise ValueError(
+                    f"{modality.upper()} test failure-case quota keys must match "
+                    "the full failure-case quota keys"
+                )
+            if any(
+                not 0 <= int(test_quotas[case]) <= int(quotas[case])
+                for case in quotas
+            ):
+                raise ValueError(
+                    f"{modality.upper()} test failure-case quotas must be between "
+                    "zero and their full quotas"
+                )
+            if sum(int(value) for value in test_quotas.values()) != test_fail:
+                raise ValueError(
+                    f"{modality.upper()} test failure-case quotas do not sum to "
+                    f"{test_fail}"
+                )
         if not (0 <= test_fail <= fail_target and 0 <= test_target - test_fail <= target - fail_target):
             raise ValueError(f"{modality.upper()} test PASS/FAIL targets are impossible")
 
@@ -761,6 +811,120 @@ def _case_assignments(config: dict[str, Any], modality: str) -> list[str]:
     cases = [case for case, count in quotas.items() for _ in range(int(count))]
     _pcg64_shuffle(cases, stable_seed(config["seed"], modality, "failure-cases"))
     return cases
+
+
+def _select_battery_group_subset(
+    groups: list[tuple[str, int, tuple[int, ...]]],
+    *,
+    target: int,
+    test_minimums: tuple[int, ...],
+    main_minimums: tuple[int, ...],
+    modality: str,
+) -> set[str]:
+    """Select whole battery groups while preserving case capacity on both sides.
+
+    Each capability tuple contains the number of eligible sources in the group.
+    Unlike the old v2.0 protection step, this DP never pins a battery merely
+    because one of its images is useful to main.  It instead constrains the
+    selected test capacity from below and from above (the latter leaves the
+    requested residual capacity for main).
+    """
+    if len(test_minimums) != len(main_minimums):
+        raise ValueError("battery-group capability dimensions do not match")
+    dimensions = len(test_minimums)
+    if any(len(capabilities) != dimensions for _, _, capabilities in groups):
+        raise ValueError("battery-group capability dimensions do not match")
+    totals = tuple(
+        sum(capabilities[index] for _, _, capabilities in groups)
+        for index in range(dimensions)
+    )
+    test_maximums = tuple(
+        totals[index] - main_minimums[index] for index in range(dimensions)
+    )
+    if any(
+        maximum < minimum
+        for minimum, maximum in zip(test_minimums, test_maximums, strict=True)
+    ):
+        raise ValueError(
+            f"{modality} does not have enough eligible sources to satisfy "
+            "test and main failure-case quotas"
+        )
+
+    zero_capabilities = (0,) * dimensions
+    Record = tuple[tuple[str, ...], tuple[int, ...]]
+
+    def add_to_frontier(frontier: list[Record], candidate: Record) -> None:
+        candidate_ids, candidate_capabilities = candidate
+        for existing_ids, existing_capabilities in frontier:
+            if all(
+                existing_capabilities[index] <= candidate_capabilities[index]
+                for index in range(dimensions)
+            ):
+                if (
+                    existing_capabilities != candidate_capabilities
+                    or existing_ids <= candidate_ids
+                ):
+                    return
+        frontier[:] = [
+            (existing_ids, existing_capabilities)
+            for existing_ids, existing_capabilities in frontier
+            if not all(
+                candidate_capabilities[index] <= existing_capabilities[index]
+                for index in range(dimensions)
+            )
+            or (
+                candidate_capabilities == existing_capabilities
+                and existing_ids < candidate_ids
+            )
+        ]
+        frontier.append(candidate)
+
+    states: dict[tuple[int, tuple[int, ...]], list[Record]] = {
+        (0, zero_capabilities): [((), zero_capabilities)]
+    }
+    for battery_id, size, capabilities in groups:
+        additions: dict[tuple[int, tuple[int, ...]], list[Record]] = {}
+        for (count, _), records in list(states.items()):
+            for selected_ids, selected_capabilities in records:
+                next_count = count + size
+                if next_count > target:
+                    continue
+                next_capabilities = tuple(
+                    selected_capabilities[index] + capabilities[index]
+                    for index in range(dimensions)
+                )
+                if any(
+                    value > test_maximums[index]
+                    for index, value in enumerate(next_capabilities)
+                ):
+                    continue
+                capped = tuple(
+                    min(next_capabilities[index], test_minimums[index])
+                    for index in range(dimensions)
+                )
+                key = (next_count, capped)
+                add_to_frontier(
+                    additions.setdefault(key, []),
+                    (selected_ids + (battery_id,), next_capabilities),
+                )
+        for key, candidates in additions.items():
+            frontier = states.setdefault(key, [])
+            for candidate in candidates:
+                add_to_frontier(frontier, candidate)
+        feasible = [
+            selected_ids
+            for (count, _), records in states.items()
+            for selected_ids, capabilities in records
+            if count == target
+            and all(capabilities[index] >= test_minimums[index] for index in range(dimensions))
+        ]
+        if feasible:
+            return set(min(feasible))
+
+    raise ValueError(
+        f"{modality} battery-group split has no exact {target}-image subset "
+        "that preserves failure-case capacity in both test and main"
+    )
 
 
 def _fingerprint(candidates: list[Candidate], raw_root: Path) -> str:
@@ -831,6 +995,14 @@ def create_plan(
     raw_root: Path, config: dict[str, Any], output: Path, reuse_scan: Path | None = None
 ) -> dict[str, Any]:
     _validate_config(config)
+    cache_only = False
+    if reuse_scan is None and bool(config.get("use_embedded_scan_cache", False)):
+        if not EMBEDDED_SCAN_CACHE.is_file():
+            raise ValueError(
+                f"embedded scan cache is missing: {EMBEDDED_SCAN_CACHE}"
+            )
+        reuse_scan = EMBEDDED_SCAN_CACHE
+        cache_only = True
     manifests = output / "manifests"
     manifests.mkdir(parents=True, exist_ok=True)
     logger = configure_logger("quality_fail_augment.plan", output / "logs" / "plan.log")
@@ -841,6 +1013,7 @@ def create_plan(
         manifests / "extraction_audit.csv",
         reuse_scan=reuse_scan,
         cache_path=manifests / "scan_cache.csv",
+        cache_only=cache_only,
     )
     _write_csv(manifests / "orphan_sources.csv", orphans, AUDIT_FIELDS)
     if systemic:
@@ -902,13 +1075,13 @@ def create_plan(
                     (
                         position
                         for position, candidate in enumerate(available)
-                        if candidate.porosity_component_count > 0
+                        if candidate.has_battery_outline
                     ),
                     -1,
                 )
                 if eligible_index < 0:
                     raise ValueError(
-                        "CT alignment quota cannot be filled from porosity sources"
+                        "CT alignment quota cannot be filled from outline sources"
                     )
             elif failure_case == "ct_beam_hardening_metal_streak":
                 eligible_index = next(
@@ -938,17 +1111,292 @@ def create_plan(
                     )
             chosen.append(available.pop(eligible_index))
         reserves = available
-        fail_order = list(sorted(fail_indices))
-        pass_order = [index for index in range(target) if index not in fail_indices]
-        _pcg64_shuffle(fail_order, stable_seed(config["seed"], modality, "test-fail"))
-        _pcg64_shuffle(pass_order, stable_seed(config["seed"], modality, "test-pass"))
-        test_indices = set(
-            fail_order[: int(config.get(f"{modality.lower()}_test_fail_target", 0))]
-            + pass_order[
-                : int(config.get(f"{modality.lower()}_test_target", 0))
-                - int(config.get(f"{modality.lower()}_test_fail_target", 0))
-            ]
+        test_target = int(config.get(f"{modality.lower()}_test_target", 0))
+        test_fail_target = int(
+            config.get(f"{modality.lower()}_test_fail_target", 0)
         )
+        test_pass_target = test_target - test_fail_target
+        if modality == "CT":
+            test_case_quotas = config.get("ct_test_failure_case_quotas")
+            if test_case_quotas is None:
+                if test_fail_target % len(config["ct_failure_case_quotas"]) != 0:
+                    raise ValueError(
+                        "ct_test_failure_case_quotas is required when CT test FAIL "
+                        "cannot be divided equally across failure cases"
+                    )
+                per_case = test_fail_target // len(config["ct_failure_case_quotas"])
+                test_case_quotas = {
+                    case: per_case for case in config["ct_failure_case_quotas"]
+                }
+            main_case_quotas = {
+                case: int(total_count) - int(test_case_quotas.get(case, 0))
+                for case, total_count in config["ct_failure_case_quotas"].items()
+            }
+            # These slots were filled through has_dense_anchor() during source
+            # selection above. Reuse that proof instead of decoding all 20,000
+            # selected CT images a second time for partition capacity checks.
+            dense_eligible_indices = {
+                index
+                for index, case in case_by_index.items()
+                if case == "ct_beam_hardening_metal_streak"
+            }
+            logger.info(
+                "CT source selection complete | selected %s | guaranteed dense %s",
+                f"{len(chosen):,}",
+                f"{len(dense_eligible_indices):,}",
+            )
+            # A battery is the leakage boundary for CT. Select complete battery
+            # groups totaling the requested test size, then assign FAIL cases
+            # inside each partition so both leakage and per-case quotas hold.
+            groups: dict[str, list[int]] = {}
+            for index, candidate in enumerate(chosen):
+                groups.setdefault(candidate.parsed.battery_id, []).append(index)
+            group_items = sorted(groups.items())
+            _pcg64_shuffle(
+                group_items, stable_seed(config["seed"], modality, "test-battery-groups")
+            )
+            outline_needed = int(
+                test_case_quotas.get("ct_cell_alignment_failure", 0)
+            )
+            dense_needed = int(
+                test_case_quotas.get("ct_beam_hardening_metal_streak", 0)
+            )
+            ct_group_capacities = []
+            for battery_id, indices in group_items:
+                outline = [
+                    bool(chosen[index].has_battery_outline) for index in indices
+                ]
+                dense = [index in dense_eligible_indices for index in indices]
+                ct_group_capacities.append(
+                    (
+                        battery_id,
+                        len(indices),
+                        (
+                            sum(outline),
+                            sum(dense),
+                            sum(a or d for a, d in zip(outline, dense, strict=True)),
+                        ),
+                    )
+                )
+            test_battery_ids = _select_battery_group_subset(
+                ct_group_capacities,
+                target=test_target,
+                test_minimums=(
+                    outline_needed,
+                    dense_needed,
+                    outline_needed + dense_needed,
+                ),
+                main_minimums=(
+                    int(main_case_quotas.get("ct_cell_alignment_failure", 0)),
+                    int(main_case_quotas.get("ct_beam_hardening_metal_streak", 0)),
+                    int(main_case_quotas.get("ct_cell_alignment_failure", 0))
+                    + int(main_case_quotas.get("ct_beam_hardening_metal_streak", 0)),
+                ),
+                modality="CT",
+            )
+            logger.info(
+                "CT battery-group split complete | test images %s | test batteries %s",
+                f"{test_target:,}",
+                f"{len(test_battery_ids):,}",
+            )
+            test_indices = {
+                index
+                for index, candidate in enumerate(chosen)
+                if candidate.parsed.battery_id in test_battery_ids
+            }
+
+            if sum(map(int, test_case_quotas.values())) != test_fail_target:
+                raise ValueError("CT test failure-case quotas must sum to ct_test_fail_target")
+            if sum(main_case_quotas.values()) != fail_target - test_fail_target:
+                raise ValueError("CT main failure-case quotas do not match the main FAIL target")
+
+            def assign_ct_cases(
+                indices: set[int], quotas: dict[str, int], scope: str
+            ) -> dict[int, str]:
+                order = sorted(indices)
+                _pcg64_shuffle(
+                    order, stable_seed(config["seed"], "CT", scope, "failure-cases")
+                )
+                remaining = list(order)
+                assigned: dict[int, str] = {}
+                alignment_needed = int(
+                    quotas.get("ct_cell_alignment_failure", 0)
+                )
+                alignment_order = [
+                    index
+                    for index in remaining
+                    if chosen[index].has_battery_outline
+                    and index not in dense_eligible_indices
+                ] + [
+                    index
+                    for index in remaining
+                    if chosen[index].has_battery_outline
+                    and index in dense_eligible_indices
+                ]
+                if len(alignment_order) < alignment_needed:
+                    raise ValueError(
+                        f"CT {scope} cannot fill ct_cell_alignment_failure quota "
+                        f"({alignment_needed}) with eligible sources"
+                    )
+                for index in alignment_order[:alignment_needed]:
+                    assigned[index] = "ct_cell_alignment_failure"
+                    remaining.remove(index)
+
+                dense_needed_here = int(
+                    quotas.get("ct_beam_hardening_metal_streak", 0)
+                )
+                dense_order = [
+                    index for index in remaining if index in dense_eligible_indices
+                ]
+                if len(dense_order) < dense_needed_here:
+                    raise ValueError(
+                        f"CT {scope} cannot fill ct_beam_hardening_metal_streak "
+                        f"quota ({dense_needed_here}) with eligible sources"
+                    )
+                for index in dense_order[:dense_needed_here]:
+                    assigned[index] = "ct_beam_hardening_metal_streak"
+                    remaining.remove(index)
+
+                cases_in_order = [
+                    case
+                    for case in quotas
+                    if case
+                    not in {
+                        "ct_cell_alignment_failure",
+                        "ct_beam_hardening_metal_streak",
+                    }
+                ]
+                for case in cases_in_order:
+                    needed = int(quotas.get(case, 0))
+                    for _ in range(needed):
+                        if not remaining:
+                            raise ValueError(
+                                f"CT {scope} cannot fill {case} quota ({needed}) "
+                                "with eligible sources"
+                            )
+                        assigned[remaining.pop(0)] = case
+                return assigned
+
+            main_indices = set(range(target)) - test_indices
+            case_by_index = {
+                **assign_ct_cases(
+                    test_indices,
+                    {case: int(count) for case, count in test_case_quotas.items()},
+                    "test",
+                ),
+                **assign_ct_cases(main_indices, main_case_quotas, "main"),
+            }
+            fail_indices = set(case_by_index)
+        else:
+            # RGB uses the same physical-battery leakage boundary as CT.
+            # Derive deterministic per-case test quotas proportionally when the
+            # config only supplies the total RGB case quotas.
+            total_case_quotas = {
+                case: int(count)
+                for case, count in config["rgb_failure_case_quotas"].items()
+            }
+            configured_test_quotas = config.get("rgb_test_failure_case_quotas")
+            if configured_test_quotas is None:
+                exact = {
+                    case: count * test_fail_target / fail_target
+                    for case, count in total_case_quotas.items()
+                }
+                test_case_quotas = {
+                    case: int(value) for case, value in exact.items()
+                }
+                remainder = test_fail_target - sum(test_case_quotas.values())
+                ranked = sorted(
+                    total_case_quotas,
+                    key=lambda case: (
+                        -(exact[case] - test_case_quotas[case]),
+                        case,
+                    ),
+                )
+                for case in ranked[:remainder]:
+                    test_case_quotas[case] += 1
+            else:
+                test_case_quotas = {
+                    case: int(count)
+                    for case, count in configured_test_quotas.items()
+                }
+            main_case_quotas = {
+                case: total_case_quotas[case] - test_case_quotas.get(case, 0)
+                for case in total_case_quotas
+            }
+
+            groups: dict[str, list[int]] = {}
+            for index, candidate in enumerate(chosen):
+                groups.setdefault(candidate.parsed.battery_id, []).append(index)
+            group_items = sorted(groups.items())
+            _pcg64_shuffle(
+                group_items, stable_seed(config["seed"], "RGB", "test-battery-groups")
+            )
+            glare_needed = int(test_case_quotas.get("rgb_reflection_glare", 0))
+            rgb_group_capacities = [
+                (
+                    battery_id,
+                    len(indices),
+                    (
+                        sum(
+                            bool(chosen[index].has_battery_outline)
+                            for index in indices
+                        ),
+                    ),
+                )
+                for battery_id, indices in group_items
+            ]
+            test_battery_ids = _select_battery_group_subset(
+                rgb_group_capacities,
+                target=test_target,
+                test_minimums=(glare_needed,),
+                main_minimums=(
+                    int(main_case_quotas.get("rgb_reflection_glare", 0)),
+                ),
+                modality="RGB",
+            )
+            test_indices = {
+                index
+                for index, candidate in enumerate(chosen)
+                if candidate.parsed.battery_id in test_battery_ids
+            }
+
+            def assign_rgb_cases(
+                indices: set[int], quotas: dict[str, int], scope: str
+            ) -> dict[int, str]:
+                order = sorted(indices)
+                _pcg64_shuffle(
+                    order, stable_seed(config["seed"], "RGB", scope, "failure-cases")
+                )
+                remaining = list(order)
+                assigned: dict[int, str] = {}
+                cases_in_order = ["rgb_reflection_glare"] + [
+                    case for case in quotas if case != "rgb_reflection_glare"
+                ]
+                for case in cases_in_order:
+                    for _ in range(int(quotas.get(case, 0))):
+                        position = next(
+                            (
+                                position
+                                for position, index in enumerate(remaining)
+                                if case != "rgb_reflection_glare"
+                                or chosen[index].has_battery_outline
+                            ),
+                            -1,
+                        )
+                        if position < 0:
+                            raise ValueError(
+                                f"RGB {scope} cannot fill {case} quota with "
+                                "eligible sources"
+                            )
+                        assigned[remaining.pop(position)] = case
+                return assigned
+
+            main_indices = set(range(target)) - test_indices
+            case_by_index = {
+                **assign_rgb_cases(test_indices, test_case_quotas, "test"),
+                **assign_rgb_cases(main_indices, main_case_quotas, "main"),
+            }
+            fail_indices = set(case_by_index)
         battery_map: dict[tuple[str, str], int] = {}
         for slot, candidate in enumerate(chosen, 1):
             source_key = (candidate.parsed.form, candidate.parsed.battery_id)
@@ -961,7 +1409,7 @@ def create_plan(
             fail = index in fail_indices
             partition = "test" if index in test_indices else "main"
             image_id = image_starts[modality] + index
-            synthetic_id = f"QF17_{modality}_{slot:08d}"
+            synthetic_id = f"QF20_{modality}_{slot:08d}"
             failure_case = case_by_index.get(index, "")
             item_seed = stable_seed(config["seed"], synthetic_id)
             case_seed = stable_seed(item_seed, failure_case) if failure_case else item_seed
@@ -1042,6 +1490,25 @@ def create_plan(
                     "partition": "",
                 }
             )
+    overlap_counts: dict[str, int] = {}
+    for modality in ("CT", "RGB"):
+        main_ids = {
+            row["original_battery_id"]
+            for row in plan_rows
+            if row["modality"] == modality and row["partition"] == "main"
+        }
+        test_ids = {
+            row["original_battery_id"]
+            for row in plan_rows
+            if row["modality"] == modality and row["partition"] == "test"
+        }
+        overlap = main_ids & test_ids
+        overlap_counts[modality] = len(overlap)
+        if overlap:
+            raise ValueError(
+                f"{modality} original battery ID leakage detected between main/test: "
+                + ", ".join(sorted(overlap)[:10])
+            )
     _write_csv(manifests / "generation_plan.csv", plan_rows, list(plan_rows[0]))
     _write_csv(manifests / "reserve_sources.csv", reserve_rows, list(reserve_rows[0]) if reserve_rows else ["modality"])
     _write_csv(manifests / "extraction_audit.csv", audit, AUDIT_FIELDS)
@@ -1052,7 +1519,9 @@ def create_plan(
     )
     metadata = {
         "schema_version": "1.1",
-        "package_version": "1.7",
+        "package_version": "2.0",
+        "ct_main_test_original_battery_overlap": overlap_counts["CT"],
+        "rgb_main_test_original_battery_overlap": overlap_counts["RGB"],
         "raw_fingerprint": fingerprint,
         "config_sha256": config_hash,
         "plan_rows": len(plan_rows),

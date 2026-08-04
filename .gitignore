@@ -2,3 +2,7 @@ __pycache__/
 *.py[cod]
 debug_*/
 .sample_staging/
+
+.env
+.venv/
+.venv_*/

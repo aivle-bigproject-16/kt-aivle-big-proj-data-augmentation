@@ -10,10 +10,16 @@ from pathlib import Path
 
 from PIL import Image
 
+from quality_fail_augment.generator import (
+    _cached_pixel_hashes_for_paths,
+    _iter_replacement_candidates,
+    _partition_by_original_battery,
+)
 from quality_fail_augment.planner import (
     PERFORMANCE_ONLY_KEYS,
     SCAN_CACHE_FIELDS,
     SCAN_CACHE_VERSION,
+    _select_battery_group_subset,
     _config_hash,
     _index_raw,
     _load_scan_cache,
@@ -27,6 +33,216 @@ from test_contract import _config, _write_raw
 def _cache_rows(path: Path) -> dict[str, dict[str, str]]:
     with path.open(encoding="utf-8-sig", newline="") as handle:
         return {row["image_stem"]: row for row in csv.DictReader(handle)}
+
+
+class ReplacementCandidateTests(unittest.TestCase):
+    def test_legacy_reserve_is_enriched_with_cache_pixel_hash(self) -> None:
+        partitions = {("RGB", "1"): "main"}
+        reserve = {
+            "modality": "RGB",
+            "reserve_rank": "1",
+            "raw_split": "training",
+            "source_stem": "RGB_cell_cylindrical_1_2",
+            "raw_image_path": "reserve.png",
+            "raw_json_path": "reserve.json",
+            "image_sha256": "image",
+            "json_sha256": "json",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "scan_cache.csv"
+            fields = [
+                "status",
+                "modality",
+                "raw_split",
+                "image_stem",
+                "raw_image_path",
+                "raw_json_path",
+                "image_sha256",
+                "json_sha256",
+                "pixel_hash",
+                "has_battery_outline",
+            ]
+            with cache_path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "status": "valid",
+                        "modality": "RGB",
+                        "raw_split": "training",
+                        "image_stem": "RGB_cell_cylindrical_1_2",
+                        "raw_image_path": "reserve.png",
+                        "raw_json_path": "reserve.json",
+                        "image_sha256": "image",
+                        "json_sha256": "json",
+                        "pixel_hash": "pixels",
+                        "has_battery_outline": "true",
+                    }
+                )
+
+            candidates = list(
+                _iter_replacement_candidates(
+                    [reserve],
+                    cache_path,
+                    "RGB",
+                    "main",
+                    "rgb_reflection_glare",
+                    partitions,
+                )
+            )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["pixel_hash"], "pixels")
+
+    def test_cached_pixel_hashes_preserve_content_uniqueness_without_rehashing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "scan_cache.csv"
+            with cache_path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=["raw_image_path", "pixel_hash"]
+                )
+                writer.writeheader()
+                writer.writerows(
+                    [
+                        {"raw_image_path": "used.png", "pixel_hash": "pixels-a"},
+                        {"raw_image_path": "other.png", "pixel_hash": "pixels-b"},
+                    ]
+                )
+
+            hashes = _cached_pixel_hashes_for_paths(cache_path, {"USED.PNG"})
+
+        self.assertEqual(hashes, {"pixels-a"})
+
+    def test_cached_replacements_stay_in_the_same_battery_partition(self) -> None:
+        plan_rows = [
+            {"modality": "RGB", "original_battery_id": "1", "partition": "main"},
+            {"modality": "RGB", "original_battery_id": "2", "partition": "test"},
+        ]
+        partitions = _partition_by_original_battery(plan_rows)
+        fields = [
+            "status",
+            "modality",
+            "raw_split",
+            "image_stem",
+            "raw_image_path",
+            "raw_json_path",
+            "image_sha256",
+            "json_sha256",
+            "has_battery_outline",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "scan_cache.csv"
+            with cache_path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(
+                    [
+                        {
+                            "status": "valid",
+                            "modality": "RGB",
+                            "raw_split": "training",
+                            "image_stem": "RGB_cell_cylindrical_1_2",
+                            "raw_image_path": "main.png",
+                            "raw_json_path": "main.json",
+                            "image_sha256": "image-main",
+                            "json_sha256": "json-main",
+                            "has_battery_outline": "true",
+                        },
+                        {
+                            "status": "valid",
+                            "modality": "RGB",
+                            "raw_split": "validation",
+                            "image_stem": "RGB_cell_cylindrical_2_2",
+                            "raw_image_path": "test.png",
+                            "raw_json_path": "test.json",
+                            "image_sha256": "image-test",
+                            "json_sha256": "json-test",
+                            "has_battery_outline": "true",
+                        },
+                        {
+                            "status": "valid",
+                            "modality": "RGB",
+                            "raw_split": "training",
+                            "image_stem": "RGB_cell_cylindrical_1_3",
+                            "raw_image_path": "main-no-outline.png",
+                            "raw_json_path": "main-no-outline.json",
+                            "image_sha256": "image-no-outline",
+                            "json_sha256": "json-no-outline",
+                            "has_battery_outline": "false",
+                        },
+                    ]
+                )
+
+            candidates = list(
+                _iter_replacement_candidates(
+                    [],
+                    cache_path,
+                    "RGB",
+                    "main",
+                    "rgb_reflection_glare",
+                    partitions,
+                )
+            )
+
+        self.assertEqual([row["raw_image_path"] for row in candidates], ["main.png"])
+
+    def test_plan_rejects_a_battery_assigned_to_both_partitions(self) -> None:
+        with self.assertRaisesRegex(ValueError, "leaks an original battery"):
+            _partition_by_original_battery(
+                [
+                    {
+                        "modality": "RGB",
+                        "original_battery_id": "1",
+                        "partition": "main",
+                    },
+                    {
+                        "modality": "RGB",
+                        "original_battery_id": "1",
+                        "partition": "test",
+                    },
+                ]
+            )
+
+
+class BatteryGroupSplitTests(unittest.TestCase):
+    def test_ct_split_does_not_preprotect_every_battery(self) -> None:
+        # Production has only 47 CT battery IDs.  The old v2.0 code protected
+        # every group for main before DP even though 112+434+454 is a valid
+        # leakage-free 1,000-image test subset.
+        sizes = [112, 434, 454] + [432] * 43 + [424]
+        self.assertEqual(sum(sizes), 20_000)
+        groups = [
+            (f"battery-{index:02d}", size, (size, size, size))
+            for index, size in enumerate(sizes)
+        ]
+
+        selected = _select_battery_group_subset(
+            groups,
+            target=1_000,
+            test_minimums=(20, 20, 40),
+            main_minimums=(380, 380, 760),
+            modality="CT",
+        )
+
+        self.assertEqual(selected, {"battery-00", "battery-01", "battery-02"})
+
+    def test_split_keeps_crossed_capability_frontier(self) -> None:
+        groups = [
+            ("0", 5, (2, 1)),
+            ("1", 5, (1, 2)),
+            ("2", 3, (3, 3)),
+            ("3", 5, (0, 4)),
+        ]
+
+        selected = _select_battery_group_subset(
+            groups,
+            target=13,
+            test_minimums=(3, 1),
+            main_minimums=(1, 2),
+            modality="CT",
+        )
+
+        self.assertEqual(selected, {"0", "2", "3"})
 
 
 class ConfigHashTests(unittest.TestCase):
@@ -87,6 +303,9 @@ class PreflightTests(unittest.TestCase):
 
 
 class ScanCacheTests(unittest.TestCase):
+    def test_cache_schema_is_v3(self) -> None:
+        self.assertEqual(SCAN_CACHE_VERSION, "3")
+
     def test_reuse_scan_reproduces_a_byte_identical_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -166,6 +385,43 @@ class ScanCacheTests(unittest.TestCase):
                     stem: row["has_battery_outline"]
                     for stem, row in second_rows.items()
                 },
+            )
+
+    def test_ct_alignment_plan_selects_an_outline_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "raw"
+            _write_raw(raw)
+            labels = sorted(
+                (raw / "Training" / "02.라벨링데이터" / "CT" / "labels").glob("*.json")
+            )
+            outlined_stem = labels[0].stem
+            for path in labels[1:]:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload["swelling"]["battery_outline"] = [1, 1, 2, 2, 3, 3]
+                path.write_text(json.dumps(payload), encoding="utf-8")
+
+            create_plan(raw, _config(), root / "plan")
+            cache = _cache_rows(root / "plan" / "manifests" / "scan_cache.csv")
+            self.assertEqual(cache[outlined_stem]["has_battery_outline"], "true")
+            self.assertTrue(
+                all(
+                    row["has_battery_outline"] == "false"
+                    for stem, row in cache.items()
+                    if row["modality"] == "CT" and stem != outlined_stem
+                )
+            )
+            with (
+                root / "plan" / "manifests" / "generation_plan.csv"
+            ).open(encoding="utf-8-sig", newline="") as handle:
+                plan = list(csv.DictReader(handle))
+            alignment = next(
+                row
+                for row in plan
+                if row["failure_case"] == "ct_cell_alignment_failure"
+            )
+            self.assertEqual(
+                Path(alignment["source_json_relative_path"]).stem, outlined_stem
             )
 
     def test_changed_source_is_revalidated_instead_of_trusted(self) -> None:

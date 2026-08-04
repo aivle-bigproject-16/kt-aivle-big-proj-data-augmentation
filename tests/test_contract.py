@@ -74,6 +74,10 @@ def _config() -> dict:
             "ct_cell_alignment_failure": 1,
             "ct_low_signal_noise": 1,
         },
+        "ct_test_failure_case_quotas": {
+            "ct_cell_alignment_failure": 1,
+            "ct_low_signal_noise": 0,
+        },
         "rgb_target": 4,
         "rgb_augmented_target": 2,
         "rgb_test_target": 2,
@@ -140,11 +144,36 @@ class PublicContractTests(unittest.TestCase):
             _write_raw(raw)
             metadata = create_plan(raw, _config(), plan_dir)
             self.assertEqual(metadata["selected_rows"], 8)
+            self.assertEqual(metadata["package_version"], "2.0")
+            self.assertEqual(metadata["ct_main_test_original_battery_overlap"], 0)
+            self.assertEqual(metadata["rgb_main_test_original_battery_overlap"], 0)
             with (plan_dir / "manifests" / "generation_plan.csv").open(
                 encoding="utf-8-sig", newline=""
             ) as handle:
                 plan_rows = list(csv.DictReader(handle))
-            self.assertTrue(all(row["synthetic_id"].startswith("QF17_") for row in plan_rows))
+            self.assertTrue(all(row["synthetic_id"].startswith("QF20_") for row in plan_rows))
+            ct_main_ids = {
+                row["original_battery_id"]
+                for row in plan_rows
+                if row["modality"] == "CT" and row["partition"] == "main"
+            }
+            ct_test_ids = {
+                row["original_battery_id"]
+                for row in plan_rows
+                if row["modality"] == "CT" and row["partition"] == "test"
+            }
+            self.assertFalse(ct_main_ids & ct_test_ids)
+            rgb_main_ids = {
+                row["original_battery_id"]
+                for row in plan_rows
+                if row["modality"] == "RGB" and row["partition"] == "main"
+            }
+            rgb_test_ids = {
+                row["original_battery_id"]
+                for row in plan_rows
+                if row["modality"] == "RGB" and row["partition"] == "test"
+            }
+            self.assertFalse(rgb_main_ids & rgb_test_ids)
             self.assertTrue(
                 {"case_seed", "group_key", "group_seed"}.issubset(plan_rows[0])
             )
@@ -164,6 +193,7 @@ class PublicContractTests(unittest.TestCase):
             histories = list(output.glob("*/**/augmentation_json/*.augmentation.json"))
             self.assertEqual(len(labels), 8)
             self.assertEqual(len(histories), 4)
+            self.assertTrue((output / "augmentation_json_4k_v2.0.zip").is_file())
 
             with (output / "manifests" / "dataset_manifest.csv").open(
                 encoding="utf-8-sig", newline=""
@@ -190,6 +220,9 @@ class PublicContractTests(unittest.TestCase):
                     self.assertEqual(history["label_json_file"], Path(row["label_json_path"]).name)
                     self.assertEqual(history["failure_case_count"], 1)
                     self.assertEqual(history["quality_label"], "fail")
+                    self.assertTrue(
+                        history["failure_case"]["source_reference"].startswith("v2.0:")
+                    )
                     self.assertTrue(history["automatic_checks"]["passed"])
                     self.assertEqual(history["output"]["format"], "JPEG")
                     self.assertEqual(history["output"]["quality"], 90)
@@ -250,6 +283,99 @@ class PublicContractTests(unittest.TestCase):
                 output / "manifests" / "recovery_audit.csv"
             ).read_text(encoding="utf-8-sig")
             self.assertIn("uncommitted.jpg", recovery)
+
+    def test_resume_rebuilds_only_the_missing_manifest_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw, plan_dir, output = root / "raw", root / "plan", root / "output"
+            _write_raw(raw)
+            config = _config()
+            create_plan(raw, config, plan_dir)
+            generate(
+                raw,
+                config,
+                plan_dir / "manifests" / "generation_plan.csv",
+                output,
+            )
+            manifest_path = output / "manifests" / "dataset_manifest.csv"
+            lineage_path = output / "manifests" / "lineage_private.csv"
+
+            def remove_last_row(path: Path) -> tuple[str, list[dict[str, str]]]:
+                with path.open(encoding="utf-8-sig", newline="") as handle:
+                    reader = csv.DictReader(handle)
+                    fields = list(reader.fieldnames or [])
+                    rows = list(reader)
+                missing_id = rows[-1]["synthetic_id"]
+                with path.open("w", encoding="utf-8-sig", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=fields)
+                    writer.writeheader()
+                    writer.writerows(rows[:-1])
+                return missing_id, rows[:-1]
+
+            missing_id, kept = remove_last_row(manifest_path)
+            lineage_missing_id, _ = remove_last_row(lineage_path)
+            self.assertEqual(lineage_missing_id, missing_id)
+            preserved_path = output / kept[0]["image_path"]
+            preserved_bytes = preserved_path.read_bytes()
+
+            resumed = generate(
+                raw,
+                config,
+                plan_dir / "manifests" / "generation_plan.csv",
+                output,
+                resume=True,
+                trust_plan=True,
+                fast_resume=True,
+            )
+
+            self.assertEqual(sum(resumed["counts"].values()), 8)
+            self.assertEqual(preserved_path.read_bytes(), preserved_bytes)
+            with manifest_path.open(encoding="utf-8-sig", newline="") as handle:
+                ids = [row["synthetic_id"] for row in csv.DictReader(handle)]
+            self.assertEqual(ids.count(missing_id), 1)
+            generation_log = (output / "logs" / "generation.log").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(
+                "resume 원본 해시 검증 축소 | 전체 8 | 검증 1 | 완료 생략 7",
+                generation_log,
+            )
+            self.assertIn(
+                "fast resume 활성화 | 미완료 1 | augmentation retry 1",
+                generation_log,
+            )
+
+    def test_resume_rejects_incomplete_private_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw, plan_dir, output = root / "raw", root / "plan", root / "output"
+            _write_raw(raw)
+            config = _config()
+            create_plan(raw, config, plan_dir)
+            generate(
+                raw,
+                config,
+                plan_dir / "manifests" / "generation_plan.csv",
+                output,
+            )
+            lineage_path = output / "manifests" / "lineage_private.csv"
+            with lineage_path.open(encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                fields = list(reader.fieldnames or [])
+                rows = list(reader)
+            with lineage_path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows[:-1])
+
+            with self.assertRaisesRegex(ValueError, "complete private lineage"):
+                generate(
+                    raw,
+                    config,
+                    plan_dir / "manifests" / "generation_plan.csv",
+                    output,
+                    resume=True,
+                )
 
     def test_resume_stops_when_committed_file_hash_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
