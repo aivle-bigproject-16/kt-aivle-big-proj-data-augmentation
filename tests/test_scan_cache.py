@@ -87,6 +87,9 @@ class PreflightTests(unittest.TestCase):
 
 
 class ScanCacheTests(unittest.TestCase):
+    def test_cache_schema_is_v3(self) -> None:
+        self.assertEqual(SCAN_CACHE_VERSION, "3")
+
     def test_reuse_scan_reproduces_a_byte_identical_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -166,6 +169,43 @@ class ScanCacheTests(unittest.TestCase):
                     stem: row["has_battery_outline"]
                     for stem, row in second_rows.items()
                 },
+            )
+
+    def test_ct_alignment_plan_selects_an_outline_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "raw"
+            _write_raw(raw)
+            labels = sorted(
+                (raw / "Training" / "02.라벨링데이터" / "CT" / "labels").glob("*.json")
+            )
+            outlined_stem = labels[0].stem
+            for path in labels[1:]:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload["swelling"]["battery_outline"] = [1, 1, 2, 2, 3, 3]
+                path.write_text(json.dumps(payload), encoding="utf-8")
+
+            create_plan(raw, _config(), root / "plan")
+            cache = _cache_rows(root / "plan" / "manifests" / "scan_cache.csv")
+            self.assertEqual(cache[outlined_stem]["has_battery_outline"], "true")
+            self.assertTrue(
+                all(
+                    row["has_battery_outline"] == "false"
+                    for stem, row in cache.items()
+                    if row["modality"] == "CT" and stem != outlined_stem
+                )
+            )
+            with (
+                root / "plan" / "manifests" / "generation_plan.csv"
+            ).open(encoding="utf-8-sig", newline="") as handle:
+                plan = list(csv.DictReader(handle))
+            alignment = next(
+                row
+                for row in plan
+                if row["failure_case"] == "ct_cell_alignment_failure"
+            )
+            self.assertEqual(
+                Path(alignment["source_json_relative_path"]).stem, outlined_stem
             )
 
     def test_changed_source_is_revalidated_instead_of_trusted(self) -> None:

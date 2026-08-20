@@ -140,11 +140,12 @@ class PublicContractTests(unittest.TestCase):
             _write_raw(raw)
             metadata = create_plan(raw, _config(), plan_dir)
             self.assertEqual(metadata["selected_rows"], 8)
+            self.assertEqual(metadata["package_version"], "1.8")
             with (plan_dir / "manifests" / "generation_plan.csv").open(
                 encoding="utf-8-sig", newline=""
             ) as handle:
                 plan_rows = list(csv.DictReader(handle))
-            self.assertTrue(all(row["synthetic_id"].startswith("QF17_") for row in plan_rows))
+            self.assertTrue(all(row["synthetic_id"].startswith("QF18_") for row in plan_rows))
             self.assertTrue(
                 {"case_seed", "group_key", "group_seed"}.issubset(plan_rows[0])
             )
@@ -164,6 +165,7 @@ class PublicContractTests(unittest.TestCase):
             histories = list(output.glob("*/**/augmentation_json/*.augmentation.json"))
             self.assertEqual(len(labels), 8)
             self.assertEqual(len(histories), 4)
+            self.assertTrue((output / "augmentation_json_4k_v1.8.zip").is_file())
 
             with (output / "manifests" / "dataset_manifest.csv").open(
                 encoding="utf-8-sig", newline=""
@@ -190,6 +192,9 @@ class PublicContractTests(unittest.TestCase):
                     self.assertEqual(history["label_json_file"], Path(row["label_json_path"]).name)
                     self.assertEqual(history["failure_case_count"], 1)
                     self.assertEqual(history["quality_label"], "fail")
+                    self.assertTrue(
+                        history["failure_case"]["source_reference"].startswith("v1.8:")
+                    )
                     self.assertTrue(history["automatic_checks"]["passed"])
                     self.assertEqual(history["output"]["format"], "JPEG")
                     self.assertEqual(history["output"]["quality"], 90)
